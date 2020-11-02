@@ -1,0 +1,21 @@
+[package]
+name = "blake2b"
+version = "0.7.0"
+authors = ["Daniel Reisinger"]
+
+description = "BLAKE2b hash function"
+
+keywords = ["blake2", "blake2b", "blake2xb", "crypto", "digest"]
+categories = ["algorithms", "cryptography"]
+
+license = "Unlicense"
+
+[profile.bench]
+lto = true
+
+[features]
+i128 = []
+
+[dev-dependencies]
+blake2-rfc = "0.2"
+rustc-serialize = "0.3"

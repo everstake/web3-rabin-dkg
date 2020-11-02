@@ -1,0 +1,18 @@
+[package]
+name = "rabin-dkg"
+version = "0.1.0"
+authors = ["Everstake"]
+edition = "2018"
+
+
+[dependencies]
+blake2b = {path = "./blake2b"}
+
+[dependencies.getrandom]
+version = "0.1.14"
+default-features = false
+optional = true
+
+[features]
+default = ["getrandom"]
+wasm-bindgen = ["getrandom/wasm-bindgen"]
