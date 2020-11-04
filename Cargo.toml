@@ -7,6 +7,9 @@ edition = "2018"
 
 [dependencies]
 blake2b = {path = "./blake2b"}
+curve25519-dalek = {git = "https://github.com/dalek-cryptography/curve25519-dalek", tag = "2.1.0"}
+serde = { version = "1.0", features = ["derive"] }
+hex = {version = "0.4"}
 
 [dependencies.getrandom]
 version = "0.1.14"
