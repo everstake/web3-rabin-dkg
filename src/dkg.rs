@@ -143,3 +143,114 @@ pub struct DistKeyGenerator {
     reconstructed: HashSet<u32>,
     sig_ctx: Vec<u8>,
 }
+
+impl DistKeyGenerator {
+    /// longterm: the secret (private) key,
+    /// participants: the list of participants pubkeys,
+    /// t: threshold parameter
+    ///
+    /// It returns an error if the secret key's commitment can't
+    /// be found in the list of participants.
+    pub fn new(
+        longterm: FE,
+        participants: Vec<GE>,
+        t: u32,
+    ) -> Result<DistKeyGenerator, Box<dyn Error>> {
+        let generator = GE::generator();
+        let pub_k: GE = generator.scalar_mul(&longterm.get_element());
+
+        let index = participants
+            .iter()
+            .position(|point| point == &pub_k)
+            .ok_or_else(|| {
+                simple_error!("dkg: own public key not found in list of participants")
+            })?;
+
+        // generate our dealer
+        let own_secret = FE::new_random();
+        let dealer = Dealer::new(longterm, own_secret, participants.clone(), t)?;
+
+        Ok(DistKeyGenerator {
+            index: index as u32,
+            long: longterm,
+            pub_key: pub_k,
+            participants,
+            t,
+            dealer,
+            verifiers: Default::default(),
+            commitments: Default::default(),
+            pending_reconstruct: Default::default(),
+            reconstructed: Default::default(),
+            sig_ctx: index.to_le_bytes().to_vec(),
+        })
+    }
+
+    /// deals returns all the deals that must be broadcasted to all
+    /// participants. The deal corresponding to this DKG is already added
+    /// to this DKG and is omitted from the returned map. To know
+    /// to which participant a deal belongs to, loop over the keys as indices in
+    /// the list of participants.
+    pub fn deals(&mut self) -> Result<HashMap<u32, Deal>, Box<dyn Error>> {
+        let deals: Vec<EncryptedDeal> = self.dealer.encrypt_deals()?;
+
+        debug_assert!(deals.len() == self.participants.len());
+
+        let mut dist_deals: HashMap<u32, Deal> = HashMap::new();
+        for (i, deal) in deals.into_iter().enumerate() {
+            let dist_d = Deal {
+                index: self.index,
+                deal,
+            };
+            if i as u32 == self.index {
+                if self.verifiers.contains_key(&self.index) {
+                    // already processed our own deal
+                    continue;
+                }
+                let resp: Response = self.process_deal(&dist_d)?;
+                if !resp.response.approved {
+                    bail!("dkg: own deal gave a complaint")
+                }
+
+                // If processed own deal correctly, set positive response in this
+                // DKG's dealer's own verifier
+                self.dealer.unsafe_set_response_dkg(self.index, true)?;
+            } else {
+                dist_deals.insert(i as u32, dist_d);
+            }
+        }
+
+        Ok(dist_deals)
+    }
+
+    /// process_deal takes a Deal created by deals() and stores and verifies it. It
+    /// returns a Response to broadcast to every other participants. It returns an
+    /// error in case the deal has already been stored, or if the deal is incorrect
+    pub fn process_deal(&mut self, dd: &Deal) -> Result<Response, Box<dyn Error>> {
+        // public key of the dealer
+        let pub_k = self
+            .participants
+            .get(dd.index as usize)
+            .ok_or_else(|| simple_error!("dkg: dist deal out of bounds index"))?;
+
+        if self.verifiers.contains_key(&dd.index) {
+            bail!("dkg: already received dist deal from same index");
+        }
+
+        // verifier receiving the dealer's deal
+        let mut ver: vssVerifier = vssVerifier::new(self.long, *pub_k, self.participants.clone())?;
+        let resp: vssResponce = ver.process_encrypted_deal(&dd.deal)?;
+
+        // Set status_approval for the verifier that represents the participant
+        // that distributed the Deal
+        // We shouldn't check result here such as call unsafe bypass method
+        ver.unsafe_set_response_dkg(dd.index, true)
+            .unwrap_or_default();
+
+        self.verifiers.insert(dd.index, ver);
+
+        Ok(Response {
+            index: dd.index,
+            response: resp,
+        })
+    }
+}
