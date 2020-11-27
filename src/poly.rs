@@ -506,3 +506,512 @@ pub fn zero_ge() -> GE {
     let zero_bytes = [0u8; 32];
     ECPoint::from_bytes(&zero_bytes).unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{PriPoly, PriShare, PubPoly, PubShare};
+    use std::collections::BTreeMap;
+    use crate::curve_traits;
+    use crate::ristretto_curve;
+
+    use curve_traits::{ECPoint, ECScalar};
+    use ristretto_curve::{FE, GE};
+
+    #[test]
+    fn test_recover_secret() {
+        let n: u32 = 10;
+        let t: u32 = 6;
+        let poly = PriPoly::new_pri_poly(t, None);
+        let mut shares = poly.shares(n);
+        let recovered = super::recover_secret(shares.as_mut_slice(), t).unwrap();
+        assert_eq!(recovered, *poly.secret());
+    }
+
+    #[test]
+    fn test_recover_commit() {
+        let n: u32 = 10;
+        let t: u32 = 6;
+        let poly = PriPoly::new_pri_poly(t.clone(), None);
+        let pub_poly = poly.commit(None);
+        let mut pub_shares = pub_poly.shares(n.clone());
+        let recovered = super::recover_commit(pub_shares.as_mut_slice(), t).unwrap();
+
+        assert_eq!(recovered, pub_poly.commit());
+    }
+
+    #[test]
+    fn test_secret_recovery() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+        let poly: PriPoly = PriPoly::new_pri_poly(t, None);
+        let mut shares = poly.shares(n); // all priv keys of pri poly
+        let recovered = super::recover_secret(shares.as_mut_slice(), t).unwrap();
+
+        assert_eq!(recovered, *poly.secret());
+    }
+
+    #[test]
+    fn test_secret_recovery_out_index() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+        let poly: PriPoly = PriPoly::new_pri_poly(t, None);
+        let mut shares = poly.shares(n); // all priv keys of pri poly
+
+        let selected = &mut shares[(n - t) as usize..];
+
+        assert_eq!(selected.len() as u32, t);
+
+        let recovered = super::recover_secret(selected, t).unwrap();
+
+        assert_eq!(recovered, *poly.secret());
+    }
+
+    #[test]
+    fn test_secret_revocery_delete() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+        let poly: PriPoly = PriPoly::new_pri_poly(t, None);
+        let mut shares = poly.shares(n); // all priv keys of pri poly
+
+        shares.remove(5);
+        shares.remove(3);
+        shares.remove(7);
+        shares.remove(1);
+
+        let recovered = super::recover_secret(shares.as_mut_slice(), t).unwrap();
+
+        assert_eq!(recovered, *poly.secret());
+    }
+
+    #[test]
+    #[should_panic(expected = "Share: not enough shares to recover secret")]
+    fn test_secret_recovery_delere_fail() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+        let poly: PriPoly = PriPoly::new_pri_poly(t, None);
+        let mut shares = poly.shares(n); // all priv keys of pri poly
+
+        shares.remove(5);
+        shares.remove(3);
+        shares.remove(7);
+        shares.remove(1);
+        shares.remove(4);
+
+        let _ = super::recover_secret(shares.as_mut_slice(), t).unwrap();
+    }
+
+    #[test]
+    fn test_secret_poly_equal() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+
+        let poly1: PriPoly = PriPoly::new_pri_poly(t, None);
+        let poly2: PriPoly = PriPoly::new_pri_poly(t, None);
+        let poly3: PriPoly = PriPoly::new_pri_poly(t, None);
+
+        let poly12 = poly1.add(&poly2).unwrap();
+        let poly13 = poly1.add(&poly3).unwrap();
+
+        let poly123 = poly12.add(&poly3).unwrap();
+        let poly132 = poly13.add(&poly2).unwrap();
+
+        assert_eq!(poly123.equal(&poly132), true);
+    }
+
+    #[test]
+    fn test_public_check() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+
+        let poly: PriPoly = PriPoly::new_pri_poly(t, None);
+        let shares = poly.shares(n); // all priv keys of pri poly
+        let pub_poly = poly.commit(None);
+
+        for p in shares.iter() {
+            assert_eq!(pub_poly.check(p), true);
+        }
+    }
+
+    #[test]
+    fn test_public_recovery() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+
+        let pri_poly: PriPoly = PriPoly::new_pri_poly(t, None);
+        let pub_poly: PubPoly = pri_poly.commit(None);
+        let mut pub_shares: Vec<PubShare<GE>> = pub_poly.shares(n);
+        let mut pub_shares2: Vec<PubShare<GE>> = pub_poly.shares(n);
+
+        let recovered = super::recover_commit(pub_shares.as_mut_slice(), t).unwrap();
+
+        assert_eq!(recovered, pub_poly.commit());
+
+        let poly_recovered = super::recover_pub_poly(pub_shares2.as_mut_slice(), t).unwrap();
+
+        assert_eq!(pub_poly.equal(poly_recovered), true);
+    }
+
+    #[test]
+    fn test_public_recovery_out_index() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+
+        let pri_poly: PriPoly = PriPoly::new_pri_poly(t, None);
+        let pub_poly: PubPoly = pri_poly.commit(None);
+        let mut pub_shares: Vec<PubShare<GE>> = pub_poly.shares(n);
+
+        let selected = &mut pub_shares[(n - t) as usize..];
+        assert_eq!(selected.len() as u32, t);
+
+        let recovered = super::recover_commit(selected, t).unwrap();
+
+        assert_eq!(recovered, pub_poly.commit());
+
+        let poly_recovered = super::recover_pub_poly(&mut pub_shares.as_mut_slice(), t).unwrap();
+        assert_eq!(pub_poly.equal(poly_recovered), true);
+    }
+
+    #[test]
+    fn test_public_recovery_delete() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+        let poly: PriPoly = PriPoly::new_pri_poly(t, None);
+        let pub_poly: PubPoly = poly.commit(None);
+        let mut shares = pub_poly.shares(n); // all priv keys of pri poly
+
+        shares.remove(5);
+        shares.remove(3);
+        shares.remove(7);
+        shares.remove(1);
+
+        let recovered = super::recover_commit(shares.as_mut_slice(), t).unwrap();
+
+        assert_eq!(recovered, pub_poly.commit());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Share: not enough good public shares to reconstruct secret commitment"
+    )]
+    fn test_public_recovery_delete_fail() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+        let poly: PriPoly = PriPoly::new_pri_poly(t, None);
+        let pub_poly: PubPoly = poly.commit(None);
+        let mut shares = pub_poly.shares(n); // all priv keys of pri poly
+
+        shares.remove(5);
+        shares.remove(3);
+        shares.remove(7);
+        shares.remove(1);
+        shares.remove(4);
+
+        let _ = super::recover_commit(shares.as_mut_slice(), t).unwrap();
+    }
+
+    #[test]
+    fn test_private_add() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+        let poly1: PriPoly = PriPoly::new_pri_poly(t, None);
+        let poly2: PriPoly = PriPoly::new_pri_poly(t, None);
+
+        let poly12 = poly1.add(&poly2).unwrap();
+
+        let poly1_s = poly1.secret();
+        let poly2_s = poly2.secret();
+        let poly12_s = poly1_s.add(&poly2_s.get_element());
+
+        assert_eq!(poly12_s, *poly12.secret());
+    }
+
+    #[test]
+    fn test_public_add() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+        let generator: GE = ECPoint::generator();
+
+        let g_scalar: FE = ECScalar::new_random();
+        let g: GE = generator.scalar_mul(&g_scalar.get_element());
+        let h_scalar: FE = ECScalar::new_random();
+        let h: GE = generator.scalar_mul(&h_scalar.get_element());
+
+        let p: PriPoly = PriPoly::new_pri_poly(t, None);
+        let q: PriPoly = PriPoly::new_pri_poly(t, None);
+
+        let p_commit = p.commit(Some(g));
+        let q_commit = q.commit(Some(h));
+        let y = q_commit.commit();
+
+        let r = p_commit.add(&q_commit).unwrap();
+
+        let mut shares = r.shares(n);
+        let recovered = super::recover_commit(shares.as_mut_slice(), t).unwrap();
+
+        let x = p_commit.commit();
+        let z = x.add_point(&y.get_element());
+
+        assert_eq!(recovered, z);
+    }
+
+    #[test]
+    fn test_public_poly_equal() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+        let generator: GE = ECPoint::generator();
+
+        let g_scalar: FE = ECScalar::new_random();
+        let g: GE = generator.scalar_mul(&g_scalar.get_element());
+
+        let poly1: PriPoly = PriPoly::new_pri_poly(t, None);
+        let poly2: PriPoly = PriPoly::new_pri_poly(t, None);
+        let poly3: PriPoly = PriPoly::new_pri_poly(t, None);
+
+        let commit1: PubPoly = poly1.commit(Some(g.clone()));
+        let commit2: PubPoly = poly2.commit(Some(g.clone()));
+        let commit3: PubPoly = poly3.commit(Some(g.clone()));
+
+        let poly12: PubPoly = commit1.add(&commit2).unwrap();
+        let poly13: PubPoly = commit1.add(&commit3).unwrap();
+
+        let poly123: PubPoly = poly12.add(&commit3).unwrap();
+        let poly132: PubPoly = poly13.add(&commit2).unwrap();
+
+        assert_eq!(poly123.equal(poly132), true);
+    }
+
+    #[test]
+    fn test_pri_poly_mul() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+
+        let a: PriPoly = PriPoly::new_pri_poly(t, None);
+        let b: PriPoly = PriPoly::new_pri_poly(t, None);
+
+        let c = a.mul(b.clone());
+        assert_eq!(
+            (a.coeffs.len() + b.coeffs.len()) as u32 - 1,
+            c.coeffs.len() as u32
+        );
+        let nul: FE = ECScalar::zero();
+        for el in c.coeffs.iter() {
+            assert_ne!(nul, *el);
+        }
+
+        let a0 = a.coeffs.get(0).unwrap();
+        let b0 = b.coeffs.get(0).unwrap();
+        let mul = b0.mul(&a0.get_element());
+        let c0 = c.coeffs.get(0).unwrap();
+        assert_eq!(*c0, mul);
+
+        let at = a.coeffs.last().unwrap();
+        let bt = b.coeffs.last().unwrap();
+        let mul = at.mul(&bt.get_element());
+        let ct = c.coeffs.last().unwrap();
+        assert_eq!(*ct, mul);
+    }
+
+    #[test]
+    fn test_recover_pri_poly() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+
+        let pri_poly: PriPoly = PriPoly::new_pri_poly(t, None);
+        let mut shares = pri_poly.shares(n);
+        let mut shares2 = shares.clone();
+        shares2.reverse();
+
+        let recovered = super::recover_pri_poly(shares.as_mut_slice(), t).unwrap();
+        let reverce_recovered = super::recover_pri_poly(shares2.as_mut_slice(), t).unwrap();
+
+        for ind in 0..t {
+            assert_eq!(recovered.eval(ind).v, pri_poly.eval(ind).v);
+            assert_eq!(reverce_recovered.eval(ind).v, pri_poly.eval(ind).v);
+        }
+    }
+
+    #[test]
+    fn test_pri_poly_coefficients() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+
+        let pri_poly: PriPoly = PriPoly::new_pri_poly(t, None);
+
+        let coeffs = pri_poly.coefficients();
+        assert_eq!(coeffs.len() as u32, t);
+
+        let b = PriPoly::coefficients_to_pri_poly(coeffs);
+        assert_eq!(pri_poly.coefficients(), b.coefficients());
+    }
+
+    #[test]
+    fn test_refresh_dkg() {
+        let n: u32 = 10;
+        let t: u32 = n / 2 + 1;
+
+        // Run an n-fold Pedersen VSS (= DKG)
+        let mut pri_polys: Vec<PriPoly> = Vec::new();
+        let mut pri_shares: BTreeMap<u32, Vec<PriShare<FE>>> = BTreeMap::new();
+        let mut pub_polys: Vec<PubPoly> = Vec::new();
+        let mut pub_shares: BTreeMap<u32, Vec<PubShare<GE>>> = BTreeMap::new();
+        for el in 0..n {
+            let p_poly: PriPoly = PriPoly::new_pri_poly(t, None);
+            pri_polys.push(p_poly.clone());
+            let p_share: Vec<PriShare<FE>> = p_poly.shares(n);
+            pri_shares.insert(el.clone(), p_share);
+            let pub_poly: PubPoly = p_poly.commit(None);
+            pub_polys.push(pub_poly.clone());
+            let pub_share: Vec<PubShare<GE>> = pub_poly.shares(n);
+            pub_shares.insert(el, pub_share);
+        }
+
+        // Verify VSS shares
+        for (map_key, map_value) in pri_shares.iter() {
+            for (v_key, v_value) in map_value.iter().enumerate() {
+                let generator: GE = ECPoint::generator();
+                let sg = generator.scalar_mul(&v_value.v.get_element());
+                assert_eq!(sg, pub_shares.get(map_key).unwrap().get(v_key).unwrap().v);
+            }
+        }
+
+        // Create private DKG shares
+        let mut dkg_shares: Vec<PriShare<FE>> = Vec::new();
+        for i in 0..n {
+            let mut acc: FE = ECScalar::zero();
+            for j in 0..n {
+                acc = acc.add(
+                    &pri_shares
+                        .get(&j)
+                        .unwrap()
+                        .get(i as usize)
+                        .unwrap()
+                        .v
+                        .get_element(),
+                );
+            }
+            dkg_shares.push(PriShare { i, v: acc });
+        }
+
+        // Create public DKG commitments (= verification vector)
+        let mut dkg_commits: Vec<GE> = Vec::new();
+        for i in 0..t {
+            let mut acc: GE = super::zero_ge();
+
+            for value in pub_polys.iter() {
+                let (_, coeff) = value.info();
+                acc = acc.add_point(&coeff.get(i as usize).unwrap().get_element());
+            }
+            dkg_commits.push(acc);
+        }
+
+        // Check that the private DKG shares verify against the public DKG commits
+        let generator: GE = ECPoint::generator();
+        let dkg_pub_poly: PubPoly = PubPoly::new_pub_poly(generator, dkg_commits.clone());
+        for value in dkg_shares.iter() {
+            assert_eq!(dkg_pub_poly.check(value), true);
+        }
+
+        // Start verifiable resharing process
+        let mut sub_pri_polys: Vec<PriPoly> = Vec::new();
+        let mut sub_pri_shares: BTreeMap<u32, Vec<PriShare<FE>>> = BTreeMap::new();
+        let mut sub_pub_polys: Vec<PubPoly> = Vec::new();
+        let mut sub_pub_shares: BTreeMap<u32, Vec<PubShare<GE>>> = BTreeMap::new();
+
+        // Create subshares and subpolys
+        for el in 0..n {
+            let p_poly: PriPoly =
+                PriPoly::new_pri_poly(t.clone(), Some(dkg_shares.get(el as usize).unwrap().v));
+            sub_pri_polys.push(p_poly.clone());
+            let p_share: Vec<PriShare<FE>> = p_poly.shares(n);
+            sub_pri_shares.insert(el, p_share);
+            let pub_poly: PubPoly = p_poly.commit(None);
+            sub_pub_polys.push(pub_poly.clone());
+            let pub_share: Vec<PubShare<GE>> = pub_poly.shares(n);
+            sub_pub_shares.insert(el, pub_share);
+            let test_scalar: FE = sub_pri_shares.get(&el).unwrap().get(0 as usize).unwrap().v;
+            let generator: GE = ECPoint::generator();
+            assert_eq!(
+                generator.scalar_mul(&test_scalar.get_element()),
+                sub_pub_shares.get(&el).unwrap().get(0 as usize).unwrap().v
+            );
+        }
+
+        // Handout shares to new nodes column-wise and verify them
+        let mut new_dkg_shares: Vec<PriShare<FE>> = Vec::new();
+        for i in 0..n {
+            let mut tmp_pri_shares: Vec<PriShare<FE>> = Vec::new(); // column-wise reshuffled sub-shares
+            let mut tmp_pub_shares: Vec<PubShare<GE>> = Vec::new(); // public commitments to old DKG private shares
+            for j in 0..n {
+                // Check 1: Verify that the received individual private subshares s_ji
+                // is correct by evaluating the public commitment vector
+                tmp_pri_shares.push(PriShare {
+                    i: j,
+                    v: sub_pri_shares.get(&j).unwrap().get(i as usize).unwrap().v,
+                }); // Shares that participant i gets from j
+                let test_scalar: FE = tmp_pri_shares.get(j as usize).unwrap().v;
+                let generator: GE = ECPoint::generator();
+                assert_eq!(
+                    generator.scalar_mul(&test_scalar.get_element()),
+                    sub_pub_polys.get(j as usize).unwrap().eval(i).v
+                );
+
+                // Check 2: Verify that the received sub public shares are
+                // commitments to the original secret
+                tmp_pub_shares.push(dkg_pub_poly.eval(j));
+                assert_eq!(
+                    tmp_pub_shares.get(j as usize).unwrap().v,
+                    sub_pub_polys.get(j as usize).unwrap().commit()
+                );
+            }
+            // Check 3: Verify that the received public shares interpolate to the
+            // original DKG public key
+            let com = super::recover_commit(tmp_pub_shares.as_mut_slice(), t).unwrap();
+            assert_eq!(*dkg_commits.get(0 as usize).unwrap(), com);
+
+            // Compute the refreshed private DKG share of node i
+            let s = super::recover_secret(tmp_pri_shares.as_mut_slice(), t).unwrap();
+            new_dkg_shares.push(PriShare { i, v: s });
+        }
+
+        // Refresh the DKG commitments (= verification vector)
+        let mut new_dkg_commits: Vec<GE> = Vec::new();
+        for i in 0..t {
+            let mut pub_shares: Vec<PubShare<GE>> = Vec::new();
+            for j in 0..n {
+                let (_, c) = sub_pub_polys.get(j as usize).unwrap().info();
+                pub_shares.push(PubShare {
+                    i: j,
+                    v: *c.get(i as usize).unwrap(),
+                });
+            }
+            let com = super::recover_commit(pub_shares.as_mut_slice(), t).unwrap();
+            new_dkg_commits.push(com);
+        }
+
+        // Check that the old and new DKG public keys are the same
+        assert_eq!(
+            dkg_commits.get(0 as usize).unwrap(),
+            new_dkg_commits.get(0 as usize).unwrap()
+        );
+
+        // Check that the old and new DKG private shares are different
+        for (i, el) in dkg_shares.iter().enumerate() {
+            assert_ne!(el.v, new_dkg_shares.get(i as usize).unwrap().v);
+        }
+
+        // Check that the refreshed private DKG shares verify against the refreshed public DKG commits
+        let b: GE = ECPoint::generator();
+        let q = PubPoly::new_pub_poly(b, new_dkg_commits);
+        for el in new_dkg_shares.iter() {
+            assert_eq!(q.check(el), true);
+        }
+
+        // Recover the private polynomial
+        let refreshed_pri_poly = super::recover_pri_poly(new_dkg_shares.as_mut_slice(), t).unwrap();
+
+        // Check that the secret and the corresponding (old) public commit match
+        let generator: GE = ECPoint::generator();
+        let p: GE = generator.scalar_mul(&refreshed_pri_poly.secret().get_element());
+        assert_eq!(p, *dkg_commits.get(0 as usize).unwrap());
+    }
+}
