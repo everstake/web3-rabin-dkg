@@ -150,3 +150,105 @@ pub struct Verifier {
     hkdf_context: Vec<u8>,
     aggregator: Aggregator,
 }
+
+impl Deal {
+    /// analyzes the deal and returns an error if it's incorrect. If
+    /// inclusion is true, it also returns an error if it the second time this struct
+    /// analyzes a Deal.
+    pub fn verify(&self, verifiers: &[GE], sid: &[u8]) -> Result<(), Box<dyn Error>> {
+        if !valid_t(self.t, verifiers) {
+            bail!("vss: invalid t received in Deal")
+        }
+
+        if sid != self.session_id.as_slice() {
+            bail!("vss: find different sessionIDs from Deal")
+        }
+
+        let fi: PriShare<FE> = self.sec_share.clone();
+        let gi: PriShare<FE> = self.rnd_share.clone();
+        if fi.i != gi.i {
+            bail!("vss: not the same index for f and g share in Deal")
+        }
+        if fi.i >= verifiers.len() as u32 {
+            bail!("vss: index out of bounds in Deal")
+        }
+        // compute fi * G + gi * H
+        let generator = GE::generator();
+        let fig: GE = generator.scalar_mul(&fi.v.get_element());
+        let h: GE = derive_h(&verifiers)?;
+        let gih: GE = h.scalar_mul(&gi.v.get_element());
+        let ci: GE = fig.add_point(&gih.get_element());
+
+        let mut commitments: Vec<GE> = Vec::new();
+        for comm in self.commitments.iter() {
+            let point = GE::from_bytes(comm.as_ref())
+                .map_err(|_| simple_error!("vss: error while construct point from bytes"))?;
+            commitments.push(point);
+        }
+        let commit_poly: PubPoly = poly::PubPoly::new(generator, commitments);
+
+        let pub_share: PubShare<GE> = commit_poly.eval(fi.i);
+        if ci != pub_share.v {
+            bail!("vss: share does not verify against commitments in Deal")
+        }
+
+        Ok(())
+    }
+}
+
+/// Hash dealer and verifiers pub keys, committments to get a unique session id
+pub fn session_id(dealer: &GE, verifiers: &[GE], commitments: &[Vec<u8>], t: u32) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.input(dealer.get_element().to_bytes());
+
+    for ver in verifiers {
+        hasher.input(ver.get_element().to_bytes());
+    }
+
+    for comm in commitments {
+        hasher.input(comm);
+    }
+
+    hasher.write_all(&t.to_le_bytes()).unwrap();
+
+    hasher
+        .result()
+        .as_slice()
+        .try_into()
+        .expect("Slice with incorrect length")
+}
+
+/// Hash verifiers pub keys as bytes and return the hash as Point
+pub fn derive_h(verifiers: &[GE]) -> Result<GE, Box<dyn Error>> {
+    let points_bytes: Vec<[u8; 32]> = verifiers
+        .iter()
+        .map(|x| x.get_element().to_bytes())
+        .collect();
+    let buffer: Vec<u8> = points_bytes.concat();
+    let hash = blake::new_blake2xb(buffer);
+    for value in hash {
+        for chunk in value.as_ref().chunks(32) {
+            if let Ok(point) = ECPoint::from_bytes(chunk) {
+                return Ok(point);
+            }
+        }
+    }
+    bail!("Error hash")
+}
+
+/// recover_secret recovers the secret shared by a Dealer by gathering at least t
+/// Deals from the verifiers. It returns an error if there is not enough Deals or
+/// if all Deals don't have the same SessionID.
+pub fn recover_secret(deals: &[Deal], t: u32) -> Result<FE, Box<dyn Error>> {
+    let mut shares: Vec<PriShare<FE>> = Vec::new();
+    let sess_id: Vec<u8> = deals[0].session_id.clone();
+    for deal in deals.iter() {
+        if bitwise_eq(&sess_id[..], &deal.session_id[..]) {
+            shares.push(deal.sec_share.clone());
+        } else {
+            bail!("vss: all deals need to have same session id")
+        }
+    }
+    let secret: FE = poly::recover_secret(shares.as_mut_slice(), t)?;
+    Ok(secret)
+}
