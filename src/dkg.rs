@@ -253,4 +253,184 @@ impl DistKeyGenerator {
             response: resp,
         })
     }
+
+    /// process_response takes a response from every other peer. If the response
+    /// designates the deal of another participants than this dkg, this dkg stores it
+    /// and returns None or a possible error regarding the validity of the response.
+    /// If the response designates a deal this dkg has issued, then the dkg will process
+    /// the response, and returns a justification.
+    pub fn process_response(
+        &mut self,
+        resp: &Response,
+    ) -> Result<Option<Justification>, Box<dyn Error>> {
+        let v: &mut vssVerifier = self
+            .verifiers
+            .get_mut(&resp.index)
+            .ok_or_else(|| simple_error!("dkg: complaint received but no deal for it"))?;
+
+        v.process_response(&resp.response)?;
+
+        if resp.index != self.index {
+            return Ok(None);
+        }
+
+        match self.dealer.process_response(&resp.response)? {
+            Some(justification) => {
+                // a justification for our own deal
+                v.process_justification(&justification)?;
+
+                Ok(Some(Justification {
+                    index: self.index,
+                    justification,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// process_justification takes a justification and validates it. It returns an
+    /// error in case the justification is wrong.
+    pub fn process_justification(&mut self, j: &Justification) -> Result<(), Box<dyn Error>> {
+        self.verifiers
+            .get_mut(&j.index)
+            .ok_or_else(|| simple_error!("dkg: Justification received but no deal for it"))?
+            .process_justification(&j.justification)
+    }
+
+    /// set_timeout triggers the timeout on all verifiers, and thus makes sure
+    /// all verifiers have either responded, or have a StatusComplaint response.
+    pub fn set_timeout(&mut self) {
+        for v in self.verifiers.values_mut() {
+            v.set_timeout();
+        }
+    }
+
+    /// certified returns true if at least t deals are certified (see
+    /// vss.Verifier.deal_certified()). If the distribution is certified, the protocol
+    /// can continue using d.SecretCommits().
+    pub fn certified(&self) -> bool {
+        self.qual().len() as u32 >= self.t
+    }
+
+    /// qual returns the index in the list of participants that forms the qualified
+    /// set as described in the "New-DKG" protocol by Rabin. Basically, it consists
+    /// of all participants that are not disqualified after having exchanged all
+    /// deals, responses and justification. This is the set that is used to extract
+    /// the distributed public key with secret_commits() and process_secret_commits().
+    pub fn qual(&self) -> Vec<u32> {
+        self.verifiers
+            .iter()
+            .filter(|(_, v)| v.deal_certified())
+            .map(|(&i, _)| i)
+            .collect()
+    }
+
+    /// Checks if verifier with idx is in qualified set
+    pub fn is_in_qual(&self, idx: u32) -> bool {
+        self.verifiers
+            .get(&idx)
+            .map(vssVerifier::deal_certified)
+            .unwrap_or(false)
+    }
+
+    /// secret_commits returns the commitments of the coefficients of the secret
+    /// polynomials. This secret commits must be broadcasted to every other
+    /// participant and must be processed by process_secret_commits. In this manner,
+    /// the coefficients are revealed through a Feldman VSS scheme.
+    /// This dkg must have its deal certified, otherwise it returns an error. The
+    /// secret_commits returned is already added to this dkg's list of secret_commits.
+    pub fn secret_commits(&mut self) -> Result<SecretCommits, Box<dyn Error>> {
+        if !self.dealer.deal_certified() {
+            bail!("dkg: can't give SecretCommits if deal not certified");
+        }
+        let commits: Vec<Vec<u8>> = self.dealer.commits().unwrap();
+        let session_id: Vec<u8> = self.dealer.get_session_id().to_vec();
+        let msg: [u8; 32] = SecretCommits::hash(&commits, self.index)?;
+        let signature = sign::sign_msg(
+            self.long.get_element().to_bytes(),
+            self.pub_key.get_element().to_bytes(),
+            &msg,
+            &self.index.to_le_bytes(),
+        )?;
+        let sc = SecretCommits {
+            index: self.index,
+            commitments: commits.clone(),
+            session_id,
+            signature,
+        };
+        // adding our own commitments
+        let commits_p = commits
+            .iter()
+            .map(|c| GE::from_bytes(&c))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        self.commitments.insert(
+            self.index,
+            poly::PubPoly::new(ECPoint::generator(), commits_p),
+        );
+        Ok(sc)
+    }
+
+    /// process_secret_commit takes a SecretCommits from every other participant and
+    /// verifies and stores it. It returns an error in case the SecretCommits is
+    /// invalid. In case the SecretCommits are valid, but this dkg can't verify its
+    /// share, it returns a ComplaintCommits that must be broadcasted to every other
+    /// participant. It returns Ok(None) otherwise.
+    pub fn process_secret_commit(
+        &mut self,
+        sc: &SecretCommits,
+    ) -> Result<Option<ComplaintCommits>, Box<dyn Error>> {
+        let pub_k: &GE = self
+            .participants
+            .get(sc.index as usize)
+            .ok_or_else(|| simple_error!("dkg: secretcommits received with index out of bounds"))?;
+
+        if !self.is_in_qual(sc.index) {
+            bail!("dkg: secretcommits from a non QUAL member");
+        }
+
+        // mapping verified by is_in_qual
+        let v: &mut vssVerifier = self.verifiers.get_mut(&sc.index).unwrap();
+
+        if !bitwise_eq(&v.session_id(), &sc.session_id) {
+            bail!("dkg: secretcommits received with wrong session id");
+        }
+
+        let msg: [u8; 32] = SecretCommits::hash(&sc.commitments, sc.index)?;
+        sign::verify_signature(
+            &pub_k.get_element().to_bytes(),
+            &sc.signature,
+            &msg,
+            &sc.index.to_le_bytes(),
+        )
+        .map_err(|e| simple_error!("dkg: invalid signature in SecretCommit: {}", e))?;
+
+        let deal: vssDeal = v.get_deal().unwrap();
+        let commitments: Vec<GE> = sc
+            .commitments
+            .iter()
+            .map(|x| ECPoint::from_bytes(x))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|x| simple_error!("Error while constructing point from bytes: {}", x))?;
+
+        let polynomial: PubPoly = PubPoly::new(ECPoint::generator(), commitments);
+        if polynomial.check(&deal.sec_share) {
+            self.commitments.insert(sc.index, polynomial);
+            Ok(None)
+        } else {
+            let msg: [u8; 32] = ComplaintCommits::hash(self.index, sc.index, &deal)?;
+            let signature = sign::sign_msg(
+                self.long.get_element().to_bytes(),
+                self.pub_key.get_element().to_bytes(),
+                &msg,
+                &self.index.to_le_bytes(),
+            )?;
+            Ok(Some(ComplaintCommits {
+                index: self.index,
+                dealer_index: sc.index,
+                deal,
+                signature,
+            }))
+        }
+    }
 }
