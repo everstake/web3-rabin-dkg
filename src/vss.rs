@@ -151,6 +151,110 @@ pub struct Verifier {
     aggregator: Aggregator,
 }
 
+impl Aggregator {
+    pub fn new(dealer: GE, verifiers: Rc<[GE]>, threshold: u32, session_id: Vec<u8>) -> Self {
+        Self {
+            dealer,
+            verifiers,
+            session_id,
+            threshold,
+            responses: HashMap::new(),
+            deal: Deal::default(),
+            bad_dealer: false,
+        }
+    }
+
+    pub fn verify_response(&mut self, r: &Response) -> Result<(), Box<dyn Error>> {
+        let s1: [u8; 32] = r.session_id.as_slice().try_into()?;
+        let s2: [u8; 32] = self.session_id.as_slice().try_into()?;
+
+        if !bitwise_eq(&s1, &s2) {
+            bail!("vss: receiving inconsistent sessionID in response");
+        }
+        let pub_k = self
+            .verifiers
+            .get(r.index as usize)
+            .ok_or_else(|| simple_error!("vss: index out of bounds in response"))?;
+        // schnorrkel PublicKey to verify signature
+        let response_h = r.hash_self()?;
+
+        sign::verify_signature(
+            pub_k.get_element().to_bytes().as_ref(),
+            r.signature.as_ref(),
+            response_h.as_ref(),
+            r.index.to_le_bytes().as_ref(),
+        )
+        .map_err(|e| simple_error!("vss: incorrect response signature: {}", e))?;
+
+        self.add_response(r)?;
+
+        Ok(())
+    }
+
+    pub fn add_response(&mut self, r: &Response) -> Result<(), Box<dyn Error>> {
+        if self.verifiers.len() <= r.index as usize {
+            bail!("vss: index out of bounds in Respose")
+        }
+        if self.responses.contains_key(&r.index) {
+            bail!("vss: already existing response from same origin")
+        }
+        self.responses.insert(r.index, r.clone());
+
+        Ok(())
+    }
+
+    pub(crate) fn unsafe_set_response_dkg(
+        &mut self,
+        index: u32,
+        approved: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let r = Response {
+            session_id: self.session_id.clone(),
+            index,
+            approved,
+            ..Default::default()
+        };
+        self.add_response(&r)
+    }
+
+    // clean_verifiers checks the aggregator's response array and creates a StatusComplaint
+    // response for all verifiers who have no response in the array.
+    pub fn clean_verifiers(&mut self) {
+        for i in 0..self.verifiers.len() as u32 {
+            if self.responses.get(&i).is_none() {
+                let response = Response {
+                    session_id: self.deal.session_id.clone(),
+                    index: i,
+                    approved: false,
+                    ..Default::default()
+                };
+                self.responses.insert(i, response);
+            }
+        }
+    }
+
+    // enough_approvals returns true if enough verifiers have sent their approval for
+    // the deal they received.
+    pub fn enough_approvals(&self) -> bool {
+        let n_approved = self.responses.values().filter(|r| r.approved).count();
+        n_approved as u32 >= self.threshold
+    }
+
+    // deal_certified returns true if there has been less than t complaints, all
+    // Justifications were correct and if enough_approvals() returns true.
+    pub fn deal_certified(&self) -> bool {
+        if self.threshold == 0 {
+            return false;
+        }
+
+        let verifiers_stable =
+            (0..self.verifiers.len() as u32).all(|i| self.responses.contains_key(&i));
+
+        let too_much_complaints: bool = !verifiers_stable || self.bad_dealer;
+        self.enough_approvals() && !too_much_complaints
+    }
+}
+
 impl Verifier {
     /// new_verifier returns a Verifier out of:
     /// - its longterm secret key
