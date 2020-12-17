@@ -151,6 +151,257 @@ pub struct Verifier {
     aggregator: Aggregator,
 }
 
+pub fn valid_t(t: u32, verifiers: &[GE]) -> bool {
+    t >= 2 && t <= verifiers.len() as u32
+}
+
+// minimum_t returns the minimum safe T that is proven to be secure with this
+// protocol. It expects n, the total number of participants.
+// WARNING: Setting a lower T could make
+// the whole protocol insecure. Setting a higher T only makes it harder to
+// reconstruct the secret.
+pub fn minimum_t(n: u32) -> u32 {
+    (n + 1) / 2
+}
+
+impl Dealer {
+    /// creates a Dealer capable of leading the secret sharing scheme. It
+    /// does not have to be trusted by other Verifiers. The security parameter t is
+    /// the number of shares required to reconstruct the secret. It is HIGHLY
+    /// RECOMMENDED to use a threshold higher or equal than what the method
+    /// minimum_t() returns, otherwise it breaks the security assumptions of the whole
+    /// scheme. It returns an error if the t is inferior or equal to 2.
+    ///
+    /// `longterm`: private key of dealer
+    /// `secret`: the secret to be shared with verifiers
+    /// `verifiers`: list of pubkeys of verifiers
+    /// `threshold`: security parameter t. Any t+1 share holders can recover the secret
+    pub fn new(
+        longterm: FE,
+        secret: FE,
+        verifiers: Vec<GE>,
+        threshold: u32,
+    ) -> Result<Dealer, Box<dyn Error>> {
+        if !valid_t(threshold, &verifiers) {
+            bail!("Invalid threshold")
+        }
+
+        let h: GE = derive_h(&verifiers)?;
+        let sec_pri_poly: PriPoly = PriPoly::new(threshold, Some(secret));
+        let rand_pri_poly: PriPoly = PriPoly::new(threshold, None);
+
+        let generator = GE::generator();
+        let dealer_pub: GE = generator.scalar_mul(&longterm.get_element());
+
+        // Compute public polynomial coefficients
+        let f_pub: PubPoly = sec_pri_poly.commit(Some(generator));
+        let g_pub: PubPoly = rand_pri_poly.commit(Some(h));
+
+        let c: PubPoly = f_pub.add(&g_pub)?;
+
+        let (_, commitments) = c.info();
+        let commitments: Vec<Vec<u8>> = commitments
+            .iter()
+            .map(|x| x.get_element().to_bytes().to_vec())
+            .collect();
+
+        let session_id: [u8; 32] = session_id(&dealer_pub, &verifiers, &commitments, threshold);
+
+        let verifiers: Rc<[GE]> = verifiers.into();
+
+        let aggregator = Aggregator::new(
+            dealer_pub,
+            verifiers.clone(),
+            threshold,
+            session_id.to_vec(),
+        );
+
+        // deals are to be encrypted and distributed to respective
+        // verifiers, one deal per verifier
+        let deals: Vec<Deal> = (0..verifiers.len() as u32)
+            .map(|i| {
+                let sec_share: PriShare<FE> = sec_pri_poly.eval(i as u32);
+                let rnd_share: PriShare<FE> = rand_pri_poly.eval(i as u32);
+                Deal {
+                    session_id: session_id.to_vec(),
+                    sec_share,
+                    rnd_share,
+                    t: threshold,
+                    commitments: commitments.clone(),
+                }
+            })
+            .collect();
+
+        let hkdf_context: Vec<u8> = dh::context(&dealer_pub, &verifiers);
+
+        let (_, secret_commits) = f_pub.info();
+        let secret_commits: Vec<Vec<u8>> = secret_commits
+            .iter()
+            .map(|x| x.get_element().to_bytes().to_vec())
+            .collect();
+
+        Ok(Dealer {
+            long: longterm,
+            pub_key: dealer_pub,
+            session_id: session_id.to_vec(),
+            secret,
+            secret_commits,
+            verifiers,
+            hkdf_context,
+            t: threshold,
+            deals,
+            aggregator,
+        })
+    }
+
+    /// encrypt_deal returns the encryption of the deal that must be given to the
+    /// verifier at index i.
+    /// The dealer first generates a temporary Diffie Hellman key, signs it using its
+    /// longterm key, and computes the shared key depending on its longterm and
+    /// ephemeral key and the verifier's public key.
+    /// This shared key is then fed into a HKDF whose output is the key to a AEAD
+    /// (AES256-GCM) scheme to encrypt the deal.
+    pub fn encrypt_deal(&self, i: u32) -> Result<EncryptedDeal, Box<dyn Error>> {
+        let v_pub = self
+            .verifiers
+            .get(i as usize)
+            .ok_or_else(|| simple_error!("dealer: wrong index to generate encrypted deal"))?;
+
+        // gen ephemeral key
+        let generator = GE::generator();
+        let dh_secret: FE = ECScalar::new_random();
+        let dh_key: GE = generator.scalar_mul(&dh_secret.get_element());
+        // signs the public key
+        let dh_pub_buf: [u8; 32] = dh_key.get_element().to_bytes();
+        let signature = sign::sign_msg(
+            self.long.get_element().to_bytes(),
+            self.pub_key.get_element().to_bytes(),
+            &dh_pub_buf,
+            &i.to_le_bytes(),
+        )?;
+
+        // AES256-GCM
+        let pre: GE = dh::dh_exchange(&dh_secret, v_pub);
+        let gcm: Aes256Gcm = dh::new_aead(&pre, &self.hkdf_context);
+
+        let nonce = GenericArray::from_slice(&[0u8; 12]);
+        let deal = self
+            .deals
+            .get(i as usize)
+            .ok_or_else(|| simple_error!("dealer: wrong index to get deal"))?;
+        let deal_buff: Vec<u8> = bincode::serialize(deal)?;
+        let pay = Payload {
+            msg: deal_buff.as_ref(),
+            aad: self.hkdf_context.as_ref(),
+        };
+        let cipher = gcm
+            .encrypt(nonce, pay)
+            .map_err(|_| simple_error!("vss: encryption failure!"))?;
+
+        Ok(EncryptedDeal {
+            cipher,
+            nonce: nonce.to_vec(),
+            dh_key,
+            signature,
+        })
+    }
+
+    // deal_certified returns true if there has been less than t complaints, all
+    // Justifications were correct and if enough_approvals() returns true.
+    pub fn deal_certified(&self) -> bool {
+        self.aggregator.deal_certified()
+    }
+
+    /// encrypt_deals calls encrypt_deal for each index of the verifier and
+    /// returns the list of encrypted deals. Each index in the returned slice
+    /// corresponds to the index in the list of verifiers.
+    pub fn encrypt_deals(&self) -> Result<Vec<EncryptedDeal>, Box<dyn Error>> {
+        (0..self.verifiers.len() as u32)
+            .map(|i| self.encrypt_deal(i))
+            .collect()
+    }
+
+    /// process_response analyzes the given Response. If it's a valid complaint, then
+    /// it returns a Justification. This Justification must be broadcasted to every
+    /// participants. If it's an invalid complaint, it returns an error about the
+    /// complaint. The verifiers will also ignore an invalid Complaint.
+    pub fn process_response(
+        &mut self,
+        r: &Response,
+    ) -> Result<Option<Justification>, Box<dyn Error>> {
+        self.aggregator.verify_response(r)?;
+
+        if r.approved {
+            return Ok(None);
+        }
+
+        let j_hash = Justification::hash(&self.session_id, r.index, &self.deals[r.index as usize])?;
+        let signature = sign::sign_msg(
+            self.long.get_element().to_bytes(),
+            self.pub_key.get_element().to_bytes(),
+            &j_hash,
+            &r.index.to_le_bytes(),
+        )?;
+
+        Ok(Some(Justification {
+            session_id: self.session_id.clone(),
+            index: r.index,
+            deal: self.deals[r.index as usize].clone(),
+            signature,
+        }))
+    }
+
+    /// secret_commit returns the commitment of the secret being shared by this
+    /// dealer. This function is only to be called once the deal has enough approvals
+    /// and is verified otherwise it returns Err.
+    pub fn secret_commit(&self) -> Result<GE, Box<dyn Error>> {
+        if !self.aggregator.enough_approvals() || !self.deal_certified() {
+            bail!("Not enough approvas or the deal is not certified");
+        }
+
+        let generator = GE::generator();
+        Ok(generator.scalar_mul(&self.secret.get_element()))
+    }
+
+    /// commits returns the commitments of the coefficient of the secret polynomial
+    /// the Dealer is sharing.
+    pub fn commits(&self) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+        if !self.aggregator.enough_approvals() || !self.deal_certified() {
+            bail!("Not enough approvas or the deal is not certified");
+        }
+
+        Ok(self.secret_commits.clone())
+    }
+
+    /// key returns the longterm key pair used by this Dealer.
+    pub fn key(&self) -> (FE, GE) {
+        (self.long, self.pub_key)
+    }
+
+    /// get_session_id returns the current sessionID generated by this dealer for this
+    /// protocol run.
+    pub fn get_session_id(&self) -> &[u8] {
+        &self.session_id
+    }
+
+    /// set_timeout tells this dealer to consider this moment the maximum time limit.
+    /// it calls cleanVerifiers which will take care of all Verifiers who have not
+    /// responded until now.
+    pub fn set_timeout(&mut self) {
+        self.aggregator.clean_verifiers()
+    }
+
+    // unsafe_set_response_dkg is an UNSAFE bypass method to allow DKG to use VSS
+    // that works on basis of approval only.
+    pub(crate) fn unsafe_set_response_dkg(
+        &mut self,
+        index: u32,
+        approved: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        self.aggregator.unsafe_set_response_dkg(index, approved)
+    }
+}
+
 impl Aggregator {
     pub fn new(dealer: GE, verifiers: Rc<[GE]>, threshold: u32, session_id: Vec<u8>) -> Self {
         Self {
