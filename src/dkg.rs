@@ -433,4 +433,275 @@ impl DistKeyGenerator {
             }))
         }
     }
+
+    /// process_complaints_commits takes any ComplaintCommits revealed through
+    /// process_secret_commits() from other participants in QUAL. It returns the
+    /// ReconstructCommits message that must be  broadcasted to every other participant
+    /// in QUAL so the polynomial in question can be reconstructed.
+    pub fn process_complaints_commits(
+        &mut self,
+        complaint_commits: &ComplaintCommits,
+    ) -> Result<ReconstructCommits, Box<dyn Error>> {
+        let issuer: &GE = self
+            .participants
+            .get(complaint_commits.index as usize)
+            .ok_or_else(|| simple_error!("dkg: commitcomplaint with unknown issuer"))?;
+
+        if !self.is_in_qual(complaint_commits.index) {
+            bail!("dkg: complaintcommit from non-qual member");
+        }
+
+        let msg: [u8; 32] = ComplaintCommits::hash(
+            complaint_commits.index,
+            complaint_commits.dealer_index,
+            &complaint_commits.deal,
+        )?;
+        sign::verify_signature(
+            &issuer.get_element().to_bytes(),
+            &complaint_commits.signature,
+            &msg,
+            &complaint_commits.index.to_le_bytes(),
+        )
+        .map_err(|e| simple_error!("dkg: invalid signature in SecretCommit: {}", e))?;
+
+        let verifier = self
+            .verifiers
+            .get_mut(&complaint_commits.dealer_index)
+            .ok_or_else(|| simple_error!("dkg: commit complaint linked to unknown verifier"))?;
+
+        // the verification should pass for the deal, and not with the secret
+        // commits. Verification 4) in DKG Rabin's paper.
+        complaint_commits
+            .deal
+            .verify(verifier.verifiers(), verifier.session_id())
+            .map_err(|e| simple_error!("dkg: verifying deal: {:?}", e))?;
+
+        let secret_commit = self
+            .commitments
+            .get(&complaint_commits.dealer_index)
+            .ok_or_else(|| simple_error!("dkg: complaint about non received commitments"))?;
+
+        if secret_commit.check(&complaint_commits.deal.sec_share) {
+            bail!("dkg: invalid complaint, deal verifying");
+        }
+
+        let deal = verifier.get_deal()?;
+
+        self.commitments.remove(&complaint_commits.dealer_index);
+
+        let msg: [u8; 32] =
+            ReconstructCommits::hash(self.index, complaint_commits.dealer_index, &deal.sec_share)?;
+        let signature = sign::sign_msg(
+            self.long.get_element().to_bytes(),
+            self.pub_key.get_element().to_bytes(),
+            &msg,
+            &self.index.to_le_bytes(),
+        )?;
+
+        let rc = ReconstructCommits {
+            session_id: complaint_commits.deal.session_id.clone(),
+            index: self.index,
+            dealer_index: complaint_commits.dealer_index,
+            share: deal.sec_share,
+            signature,
+        };
+
+        self.pending_reconstruct
+            .entry(complaint_commits.dealer_index)
+            .or_default()
+            .push(rc.clone());
+
+        Ok(rc)
+    }
+
+    /// process_reconstruct_commits takes a ReconstructCommits message and stores it
+    /// along any others. If there are enough messages to recover the coefficients of
+    /// the public polynomials of the malicious dealer in question, then the
+    /// polynomial is recovered.
+    pub fn process_reconstruct_commits(
+        &mut self,
+        rs: &ReconstructCommits,
+    ) -> Result<(), Box<dyn Error>> {
+        if self.reconstructed.contains(&rs.dealer_index) {
+            return Ok(());
+        }
+
+        if self.commitments.get(&rs.dealer_index).is_some() {
+            bail!("dkg: commitments not invalidated by any complaints")
+        }
+
+        let pub_k = self
+            .participants
+            .get(rs.index as usize)
+            .ok_or_else(|| simple_error!("dkg: reconstruct commits with invalid verifier index"))?;
+
+        let msg: [u8; 32] = ReconstructCommits::hash(rs.index, rs.dealer_index, &rs.share)?;
+        sign::verify_signature(
+            pub_k.get_element().to_bytes().as_ref(),
+            rs.signature.as_ref(),
+            msg.as_ref(),
+            rs.index.to_le_bytes().as_ref(),
+        )
+        .map_err(|e| simple_error!("dkg: invalid signature in ReconstructCommits: {}", e))?;
+
+        let rec_comms = self.pending_reconstruct.entry(rs.dealer_index).or_default();
+        // check if packet is already received or not
+        // or if the session ID does not match the others
+        for rec_comm in rec_comms.iter() {
+            if rec_comm.index == rs.index {
+                return Ok(());
+            }
+            if !bitwise_eq(rec_comm.session_id.as_ref(), rs.session_id.as_ref()) {
+                bail!("dkg: reconstruct commits invalid session id");
+            }
+        }
+        rec_comms.push(rs.clone());
+
+        // check if we can reconstruct commitments
+        if rec_comms.len() as u32 >= self.t {
+            let mut shares: Vec<PriShare<FE>> = Vec::new();
+            for el in rec_comms.iter() {
+                shares.push(el.share.clone());
+            }
+            // error only happens when you have less than t shares, but we ensure
+            // there are more just before
+            let pri_poly: PriPoly = poly::recover_pri_poly(&mut shares, self.t as u32)?;
+            let commit: PubPoly = pri_poly.commit(None);
+            self.commitments.insert(rs.dealer_index, commit);
+            // note it has been reconstructed.
+            self.reconstructed.insert(rs.dealer_index);
+            self.pending_reconstruct.remove(&rs.dealer_index);
+        }
+
+        Ok(())
+    }
+
+    /// finished returns true if the DKG has operated the protocol correctly and has
+    /// all necessary information to generate the DistKeyShare() by itself. It
+    /// returns false otherwise.
+    pub fn finished(&self) -> bool {
+        let mut nb: u32 = 0;
+        for (i, v) in self.verifiers.iter() {
+            if v.deal_certified() {
+                nb += 1;
+                // ALL QUAL members should have their commitments by now either given or
+                // reconstructed.
+                if self.commitments.get(i).is_none() {
+                    return false;
+                }
+            }
+        }
+        nb >= self.t
+    }
+
+    /// dist_key_share generates the distributed key relative to this receiver
+    /// It throws an error if something is wrong such as not enough deals received.
+    /// The shared secret can be computed when all deals have been sent and
+    /// basically consists of a public point and a share. The public point is the sum
+    /// of all aggregated individual public commits of each individual secrets.
+    /// the share is evaluated from the global Private Polynomial, basically SUM of
+    /// fj(i) for a receiver i.
+    pub fn dist_key_share(&self) -> Result<DistKeyShare, Box<dyn Error>> {
+        if !self.certified() {
+            bail!("dkg: distributed key not certified")
+        }
+
+        let mut sh: FE = ECScalar::zero();
+        let mut pub_poly: Option<PubPoly> = None;
+        for (i, v) in self.verifiers.iter() {
+            if v.deal_certified() {
+                // share of dist. secret = sum of all share received.
+                let s: FE = v.get_deal().unwrap().sec_share.v;
+                sh = sh.add(&s.get_element());
+                // Dist. public key = sum of all revealed commitments
+                let poly = self.commitments.get(&i).ok_or_else(|| {
+                    simple_error!("dkg: protocol not finished: commitments from {} missing", i)
+                })?;
+                if pub_poly.is_none() {
+                    // first polynomial we see (instead of generating n empty commits)
+                    pub_poly.replace(poly.clone());
+                    continue;
+                }
+                let sum_poly: PubPoly = pub_poly.unwrap().add(poly)?;
+                pub_poly = Some(sum_poly);
+            }
+        }
+
+        let (_, commits): (_, Vec<GE>) = pub_poly.unwrap().info();
+
+        Ok(DistKeyShare {
+            commits,
+            share: PriShare {
+                i: self.index,
+                v: sh,
+            },
+        })
+    }
+
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+}
+
+impl DistKeyShare {
+    // get_public_key returns the public key associated with the distributed private key.
+    pub fn get_public_key(&self) -> GE {
+        self.commits[0]
+    }
+
+    pub fn get_pri_share(&self) -> PriShare<FE> {
+        self.share.clone()
+    }
+
+    pub fn get_commitments(&self) -> &[GE] {
+        &self.commits
+    }
+}
+
+impl SecretCommits {
+    /// hash returns the hash value of data used in the signature process.
+    pub fn hash(commitments: &[Vec<u8>], index: u32) -> Result<[u8; 32], Box<dyn Error>> {
+        let mut hasher = Sha256::new();
+        hasher.write_all(b"secretcommits".as_ref()).unwrap();
+        hasher.write_all(&index.to_le_bytes()).unwrap();
+        for comm in commitments.iter() {
+            hasher.write_all(comm.as_ref()).unwrap();
+        }
+        let result = hasher.result().as_slice().try_into()?;
+        Ok(result)
+    }
+}
+
+impl ComplaintCommits {
+    /// hash returns the hash value of this struct used in the signature process.
+    pub fn hash(index: u32, dealer_index: u32, deal: &vssDeal) -> Result<[u8; 32], Box<dyn Error>> {
+        let deal_buff: Vec<u8> = bincode::serialize(deal)?;
+
+        let mut hasher = Sha256::new();
+        hasher.write_all(b"commitcomplaint".as_ref())?;
+        hasher.write_all(&index.to_le_bytes())?;
+        hasher.write_all(&dealer_index.to_le_bytes())?;
+        hasher.write_all(deal_buff.as_ref())?;
+
+        let result = hasher.result().as_slice().try_into()?;
+        Ok(result)
+    }
+}
+
+impl ReconstructCommits {
+    /// hash returns the hash value of this struct used in the signature process.
+    pub fn hash(
+        index: u32,
+        dealer_index: u32,
+        sec_share: &PriShare<FE>,
+    ) -> Result<[u8; 32], Box<dyn Error>> {
+        let mut hasher = Sha256::new();
+        hasher.write_all(b"reconstructcommits".as_ref())?;
+        hasher.write_all(&index.to_le_bytes())?;
+        hasher.write_all(&dealer_index.to_le_bytes())?;
+        hasher.write_all(sec_share.hash().as_ref())?;
+
+        let result = hasher.result().as_slice().try_into()?;
+        Ok(result)
+    }
 }
