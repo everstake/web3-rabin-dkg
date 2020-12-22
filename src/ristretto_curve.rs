@@ -1,8 +1,10 @@
-use std::error::Error;
-use std::fmt;
+//! Ristretto curve - the cryptographic backend of the library
 
 use crate::curve_traits::{ECPoint, ECScalar};
 use crate::utils;
+use std::convert::From;
+use std::error::Error;
+use std::fmt;
 
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED;
 use curve25519_dalek::ristretto::CompressedRistretto;
@@ -31,17 +33,38 @@ pub struct RistrettoCurvPoint {
 pub type GE = RistrettoCurvPoint;
 pub type FE = RistrettoScalar;
 
+impl From<u64> for RistrettoScalar {
+    fn from(n: u64) -> Self {
+        let mut v = n.to_le_bytes().to_vec();
+        v.resize(SECRET_KEY_SIZE, 0);
+        let bytes_array_32 = utils::arr32_from_slice(&v).expect("Wrong byte vec size");
+        Self {
+            purpose: "from_big_int",
+            fe: SK::from_bytes_mod_order(bytes_array_32),
+        }
+    }
+}
+
+impl From<SK> for RistrettoScalar {
+    fn from(scalar: SK) -> Self {
+        Self {
+            purpose: "from_scalar",
+            fe: scalar,
+        }
+    }
+}
+
 impl ECScalar<SK> for RistrettoScalar {
-    fn new_random() -> RistrettoScalar {
-        RistrettoScalar {
+    fn new_random() -> Self {
+        Self {
             purpose: "random",
             fe: SK::random(&mut utils::rand_hack()),
         }
     }
 
-    fn zero() -> RistrettoScalar {
+    fn zero() -> Self {
         let q_fe: Scalar = Scalar::from_bytes_mod_order([0; SECRET_KEY_SIZE]);
-        RistrettoScalar {
+        Self {
             purpose: "zero",
             fe: q_fe,
         }
@@ -54,72 +77,43 @@ impl ECScalar<SK> for RistrettoScalar {
         self.fe = element
     }
 
-    fn from(n: u64) -> RistrettoScalar {
-        let mut v: Vec<u8> = utils::to_32_vector(n as f64);
-        let mut bytes_array_32: [u8; 32];
-        let mut bytes_array_64: [u8; 64];
-        if v.len() < SECRET_KEY_SIZE {
-            let mut template = vec![0; SECRET_KEY_SIZE - v.len()];
-            template.extend_from_slice(&v);
-            v = template;
-        }
-        if v.len() > SECRET_KEY_SIZE && v.len() < 2 * SECRET_KEY_SIZE {
-            let mut template = vec![0; 2 * SECRET_KEY_SIZE - v.len()];
-            template.extend_from_slice(&v);
-            v = template;
-        }
-        if v.len() == SECRET_KEY_SIZE {
-            bytes_array_32 = [0; SECRET_KEY_SIZE];
-            let bytes = &v[..];
-            bytes_array_32.copy_from_slice(&bytes);
-            bytes_array_32.reverse();
-            RistrettoScalar {
-                purpose: "from_big_int",
-                fe: SK::from_bytes_mod_order(bytes_array_32),
-            }
-        } else {
-            bytes_array_64 = [0; 2 * SECRET_KEY_SIZE];
-            let bytes = &v[..];
-            bytes_array_64.copy_from_slice(&bytes);
-            bytes_array_64.reverse();
-            RistrettoScalar {
-                purpose: "from_big_int",
-                fe: SK::from_bytes_mod_order_wide(&bytes_array_64),
-            }
-        }
-    }
-
     fn to_hex(&self) -> String {
         encode(self.get_element().to_bytes())
     }
 
-    fn add(&self, other: &SK) -> RistrettoScalar {
-        RistrettoScalar {
+    fn add(&self, other: &SK) -> Self {
+        Self {
             purpose: "add",
             fe: self.get_element() + other,
         }
     }
 
-    fn mul(&self, other: &SK) -> RistrettoScalar {
-        RistrettoScalar {
+    fn mul(&self, other: &SK) -> Self {
+        Self {
             purpose: "mul",
             fe: self.get_element() * other,
         }
     }
 
-    fn sub(&self, other: &SK) -> RistrettoScalar {
-        RistrettoScalar {
+    fn sub(&self, other: &SK) -> Self {
+        Self {
             purpose: "sub",
             fe: self.get_element() - other,
         }
     }
 
-    fn invert(&self) -> RistrettoScalar {
+    fn invert(&self) -> Self {
         let inv: SK = self.get_element().invert();
-        RistrettoScalar {
+        Self {
             purpose: "invert",
             fe: inv,
         }
+    }
+}
+
+impl Default for RistrettoScalar {
+    fn default() -> Self {
+        Self::zero()
     }
 }
 
@@ -152,7 +146,7 @@ impl<'de> Visitor<'de> for RistrettoScalarVisitor {
 
     fn visit_str<E: de::Error>(self, s: &str) -> Result<RistrettoScalar, E> {
         let s_bytes: Vec<u8> = decode(s).expect("Failed in decoding");
-        let b: [u8; 32] = utils::from_slice(s_bytes.as_ref()).expect("Failed in array creation");
+        let b: [u8; 32] = utils::arr32_from_slice(&s_bytes).expect("Failed in array creation");
         let s: Scalar = Scalar::from_bytes_mod_order(b);
         Ok(RistrettoScalar {
             purpose: "from_bytes",
@@ -176,8 +170,7 @@ impl ECPoint<PK, SK> for RistrettoCurvPoint {
     }
 
     fn pk_to_key_slice(&self) -> Vec<u8> {
-        let result = self.ge.to_bytes();
-        result.to_vec()
+        self.ge.to_bytes().to_vec()
     }
 
     fn get_element(&self) -> PK {
@@ -189,47 +182,19 @@ impl ECPoint<PK, SK> for RistrettoCurvPoint {
     }
 
     fn from_bytes(bytes: &[u8]) -> Result<RistrettoCurvPoint, Box<dyn Error>> {
-        let bytes_vec = bytes.to_vec();
-        let mut bytes_array_32 = [0u8; 32];
-        let byte_len = bytes_vec.len();
-        match byte_len {
-            0..=32 => {
-                let mut template = vec![0; 32 - bytes_vec.len()];
-                template.extend_from_slice(&bytes);
-                let bytes_vec = template;
-                let bytes_slice = &bytes_vec[0..32];
-                bytes_array_32.copy_from_slice(&bytes_slice);
-                let r_point: PK = CompressedRistretto::from_slice(&bytes_array_32);
-                let r_point_compress = r_point.decompress();
-                match r_point_compress {
-                    Some(x) => {
-                        let new_point = RistrettoCurvPoint {
-                            purpose: "random",
-                            ge: x.compress(),
-                        };
-                        Ok(new_point)
-                    }
-                    None => bail!("Invalid Public Key"),
-                }
-            }
-
-            _ => {
-                let bytes_slice = &bytes_vec[0..32];
-                bytes_array_32.copy_from_slice(&bytes_slice);
-                let r_point: PK = CompressedRistretto::from_slice(&bytes_array_32);
-                let r_point_compress = r_point.decompress();
-                match r_point_compress {
-                    Some(x) => {
-                        let new_point = RistrettoCurvPoint {
-                            purpose: "random",
-                            ge: x.compress(),
-                        };
-                        Ok(new_point)
-                    }
-                    None => bail!("Invalid Public Key"),
-                }
-            }
+        let mut bytes_vec = bytes.to_vec();
+        if bytes_vec.len() < 32 {
+            bytes_vec.resize(32, 0);
         }
+        let r_point: PK = CompressedRistretto::from_slice(&bytes_vec[0..32]);
+        let r_point_compress = r_point.decompress();
+        let new_point = r_point_compress
+            .map(|x| RistrettoCurvPoint {
+                purpose: "random",
+                ge: x.compress(),
+            })
+            .ok_or_else(|| simple_error!("Invalid Public Key"))?;
+        Ok(new_point)
     }
 
     fn scalar_mul(&self, fe: &SK) -> RistrettoCurvPoint {
@@ -286,10 +251,10 @@ impl<'de> Visitor<'de> for RistrettoCurvPointVisitor {
 
     fn visit_str<E: de::Error>(self, s: &str) -> Result<RistrettoCurvPoint, E> {
         let s_bytes: Vec<u8> = decode(s).expect("Failed in decoding");
-        let g: CompressedRistretto = CompressedRistretto::from_slice(s_bytes.as_ref());
+        let ge: CompressedRistretto = CompressedRistretto::from_slice(&s_bytes);
         Ok(RistrettoCurvPoint {
             purpose: "from_bytes",
-            ge: g,
+            ge,
         })
     }
 }
