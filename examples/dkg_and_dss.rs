@@ -53,6 +53,7 @@ fn main() {
     let mut nodes: Vec<Node> = Vec::new();
     let mut pub_keys: Vec<GE> = Vec::new();
     // 1. Init the nodes
+    println!("1. Nodes initialization...");
     let generator = GE::generator();
     for index in 0..n_nodes {
         let priv_k: FE = ECScalar::new_random();
@@ -64,14 +65,18 @@ fn main() {
             pub_k,
             ..Default::default()
         });
+        println!("Node with pub key {:?} was initialized", pub_k.to_hex());
     }
+    println!("All the nodes were initialized");
     // 2. Create the DKGs on each node
+    println!("\n2. Every node creates DistKeyGenerator struct which is runs DKG protocol.");
     for node in &mut nodes {
         let dkg = DistKeyGenerator::new(node.priv_k, pub_keys.clone(), threshold)
             .expect("Failed to create dkg");
         node.dkg = Some(dkg);
     }
     // 3. Each node sends its Deals to the other nodes
+    println!("\n3. Nodes start to send Deals to each others. These Deals are encrypted and decrypt it can only receiver.");
     for i in 0..n_nodes {
         let deals = nodes[i].dkg_mut().deals().expect("Failed to create deals");
         for (i, deal) in deals.into_iter() {
@@ -79,6 +84,7 @@ fn main() {
         }
     }
     // 4. Process the Deals on each node and send the responses to the other
+    println!("\n4. After Node receive Deals it start to process it and in result create Response on every Deal which also sends to other Nodes for check.");
     for i in 0..n_nodes {
         let deals = nodes[i].deals.clone();
         let resps = deals
@@ -94,7 +100,9 @@ fn main() {
             }
         }
     }
+    println!("\nExample of Response - {:?}", nodes[0].resps[0]);
     // 5. Process the responses on each node
+    println!("\n5. Every node start to process received Responses.");
     for node in &mut nodes {
         let resps = node.resps.clone();
         for resp in &resps {
@@ -104,11 +112,13 @@ fn main() {
         }
     }
     // 6. Check if all deals certified
+    println!("\n6. Check if all deals certified, means that other Nodes processed it successfully.");
     for node in &nodes {
         assert!(node.dkg_ref().certified());
         assert_eq!(n_nodes, node.dkg_ref().qual().len());
     }
     // 7. Get secret committs and distribute them
+    println!("\n7. Every node distribute it's secret commit to others to process it.");
     let scs = nodes
         .iter_mut()
         .map(|node| node.dkg_mut().secret_commits())
@@ -121,7 +131,9 @@ fn main() {
                 .expect("Failed to process secret commits");
         }
     }
+    println!("Example of secret commit - {:?}", scs[0]);
     // 8. Get distributed key shares, get public key
+    println!("\n8. Every Node knows public key of distributed secret.");
     let shares = nodes
         .iter()
         .map(|node| node.dkg_ref().dist_key_share())
@@ -129,8 +141,9 @@ fn main() {
         .expect("Failed to get dist key shares");
     // pub_k is the the same for every share
     let shared_pub_k = shares[0].get_public_key();
-    println!("Got distributed public key");
+    println!("Pub key - {:?}", shared_pub_k.to_hex());
     // 9. Create distributed signature service for each node
+    println!("\n9. Every Node creates distributed signature service to sign message.");
     let message_to_sign = b"Alice cosigned with Bob";
     for (node, share) in nodes.iter_mut().zip(&shares) {
         node.dss = Some(
@@ -145,7 +158,8 @@ fn main() {
             .expect("Failed to create dss"),
         );
     }
-    // 10. Using DSS, create and distribue partial signatures
+    // 10. Using DSS, create and distribute partial signatures
+    println!("\n10. Every Node creates and distribute a part of signature.");
     let part_sigs = nodes
         .iter_mut()
         .map(|node| node.dss_mut().partial_sig())
@@ -165,8 +179,10 @@ fn main() {
         .dss_ref()
         .signature()
         .expect("Failed to get signature");
+    println!("\n11. Every Node now can reconstruct full signature.");
+    println!("Signature - {:?}", signature);
     let verified = verify(shared_pub_k, message_to_sign, &signature)
         .expect("Failed to verify shared signature");
-    println!("Verified: {}", verified);
+    println!("Now we can verify signature with pub key of distributed secret.\nVerified - {:?}", verified);
     assert!(verified);
 }
