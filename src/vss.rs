@@ -874,3 +874,835 @@ pub fn recover_secret(deals: &[Deal], t: u32) -> Result<FE, Box<dyn Error>> {
     let secret: FE = poly::recover_secret(shares.as_mut_slice(), t)?;
     Ok(secret)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::curve_traits;
+    use crate::ristretto_curve;
+    use dh::*;
+    use utils::bitwise_eq;
+
+    use curve_traits::{ECPoint, ECScalar};
+    use ristretto_curve::{FE, GE};
+    use schnorrkel::context::signing_context;
+    use schnorrkel::{Keypair, Signature};
+
+    struct InitData {
+        nb_verifiers: u32,
+        vss_threshold: u32,
+        verifiers_pub: Vec<GE>,
+        verifiers_sec: Vec<FE>,
+        dealer_pub: GE,
+        dealer_sec: FE,
+        secret: FE,
+    }
+
+    fn setup(nb_verifiers: u32) -> InitData {
+        let (verifiers_sec, verifiers_pub) = gen_commits(nb_verifiers);
+        let (dealer_sec, dealer_pub) = gen_pair();
+        let (secret, _) = gen_pair();
+        let vss_threshold: u32 = minimum_t(nb_verifiers);
+        InitData {
+            nb_verifiers,
+            vss_threshold,
+            verifiers_pub,
+            verifiers_sec,
+            dealer_pub,
+            dealer_sec,
+            secret,
+        }
+    }
+
+    fn gen_pair() -> (FE, GE) {
+        let generator = GE::generator();
+        let g_scalar: FE = ECScalar::new_random();
+        let g_point: GE = generator.scalar_mul(&g_scalar.get_element());
+        (g_scalar, g_point)
+    }
+
+    fn gen_commits(n: u32) -> (Vec<FE>, Vec<GE>) {
+        (0..n).map(|_| gen_pair()).unzip()
+    }
+
+    fn gen_dealer(
+        dealer_sec: FE,
+        secret: FE,
+        verifiers_pub: Vec<GE>,
+        vss_threshold: u32,
+    ) -> super::Dealer {
+        Dealer::new(dealer_sec, secret, verifiers_pub, vss_threshold).unwrap()
+    }
+
+    fn gen_all(data: &InitData) -> (Dealer, Vec<Verifier>) {
+        let dealer: Dealer = gen_dealer(
+            data.dealer_sec,
+            data.secret,
+            data.verifiers_pub.clone(),
+            data.vss_threshold,
+        );
+        let mut verifiers: Vec<Verifier> = Vec::new();
+        for i in 0..data.nb_verifiers {
+            let v: Verifier = Verifier::new(
+                data.verifiers_sec[i as usize],
+                data.dealer_pub,
+                data.verifiers_pub.clone(),
+            )
+            .unwrap();
+            verifiers.push(v);
+        }
+        (dealer, verifiers)
+    }
+
+    fn custom_signature() -> Vec<u8> {
+        let keypair: Keypair = Keypair::generate_with(utils::rand_hack());
+        let context = signing_context(b"some context");
+        let message: &[u8] = b"Very secret message";
+        let signature: Signature = keypair.sign(context.bytes(message));
+        signature.to_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_vss_whole() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, mut verifiers) = gen_all(&init_data);
+
+        // 1. dispatch deal
+        let mut resps: Vec<Response> = Vec::new();
+        let enc_deals: Vec<EncryptedDeal> = dealer.encrypt_deals().unwrap();
+        for (i, deal) in enc_deals.iter().enumerate() {
+            let resp: Response = verifiers[i].process_encrypted_deal(&deal).unwrap();
+            resps.push(resp);
+        }
+
+        // 2. dispatch responces
+        for resp in resps.iter() {
+            for (i, v) in verifiers.iter_mut().enumerate() {
+                if resp.index == i as u32 {
+                    continue;
+                }
+                v.process_response(&resp).unwrap();
+            }
+            // 2.1. check dealer
+            let justification = dealer.process_response(&resp).unwrap();
+            assert_eq!(None, justification);
+        }
+
+        // 3. check certified
+        for v in verifiers.iter() {
+            assert!(v.aggregator.deal_certified());
+        }
+
+        // 4. collect deals
+        let mut deals: Vec<Deal> = Vec::new();
+        for v in verifiers.iter_mut() {
+            let d: Deal = v.get_deal().unwrap();
+            deals.push(d);
+        }
+
+        // 5. recover
+        let sec = recover_secret(&deals, init_data.vss_threshold).unwrap();
+        assert_eq!(sec, dealer.secret);
+    }
+
+    #[test]
+    fn test_vss_dealer_new() {
+        let init_data: InitData = setup(7);
+        Dealer::new(
+            init_data.dealer_sec,
+            init_data.secret,
+            init_data.verifiers_pub.clone(),
+            init_data.vss_threshold,
+        )
+        .expect("Failed to create dealer");
+
+        for threshold in 0..=1 {
+            Dealer::new(
+                init_data.dealer_sec,
+                init_data.secret,
+                init_data.verifiers_pub.clone(),
+                threshold as u32,
+            )
+            .expect_err("Can't create dealer with threshold 0, 1");
+        }
+    }
+
+    #[test]
+    fn test_vss_verifier_new() {
+        let init_data: InitData = setup(7);
+        let rnd_index = 4;
+        let v = Verifier::new(
+            init_data.verifiers_sec[rnd_index as usize],
+            init_data.dealer_pub,
+            init_data.verifiers_pub.clone(),
+        )
+        .expect("Must create verifier");
+
+        assert_eq!(rnd_index as u32, v.index);
+
+        let rand_scalar: FE = ECScalar::new_random();
+        Verifier::new(rand_scalar, init_data.dealer_pub, init_data.verifiers_pub)
+            .expect_err("Can't create verifier with wrong longterm secret");
+    }
+
+    #[test]
+    fn test_vss_share() {
+        let init_data: InitData = setup(7);
+        let (dealer, mut verifiers) = gen_all(&init_data);
+
+        let ver: &mut Verifier = &mut verifiers[0];
+        let deal: EncryptedDeal = dealer.encrypt_deal(0 as u32).unwrap();
+
+        let resp: Response = ver.process_encrypted_deal(&deal).unwrap();
+
+        assert!(resp.approved);
+
+        for i in 0..ver.aggregator.threshold - 1 {
+            ver.aggregator.responses.insert(
+                i as u32,
+                Response {
+                    approved: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        ver.set_timeout();
+
+        // not enough approvals
+        ver.get_deal().expect_err("Not enough approvals");
+        ver.aggregator.responses.insert(
+            ver.aggregator.threshold,
+            Response {
+                approved: true,
+                ..Default::default()
+            },
+        );
+        // deal not certified
+        ver.aggregator.bad_dealer = true;
+        ver.get_deal().expect_err("Must fail, bad dealer");
+        ver.aggregator.bad_dealer = false;
+        ver.get_deal().expect("Must work fine");
+    }
+
+    #[test]
+    fn test_vss_aggregator_enough_approvals() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, _) = gen_all(&init_data);
+
+        for i in 0..dealer.aggregator.threshold - 1 {
+            dealer.aggregator.responses.insert(
+                i as u32,
+                Response {
+                    approved: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        dealer.set_timeout();
+
+        assert!(!dealer.aggregator.enough_approvals());
+        assert!(dealer.secret_commit().is_err());
+
+        dealer.aggregator.responses.insert(
+            dealer.aggregator.threshold,
+            Response {
+                approved: true,
+                ..Default::default()
+            },
+        );
+        assert!(dealer.aggregator.enough_approvals());
+
+        for i in (dealer.aggregator.threshold + 1)..init_data.nb_verifiers {
+            dealer.aggregator.responses.insert(
+                i as u32,
+                Response {
+                    approved: true,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(dealer.aggregator.enough_approvals());
+        let generator = GE::generator();
+        let s = generator.scalar_mul(&init_data.secret.get_element());
+        assert_eq!(s, dealer.secret_commit().unwrap());
+    }
+
+    #[test]
+    fn test_vss_aggregator_deal_certified() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, _) = gen_all(&init_data);
+
+        for i in 0..dealer.aggregator.threshold {
+            dealer.aggregator.responses.insert(
+                i as u32,
+                Response {
+                    approved: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        dealer.set_timeout();
+
+        assert!(dealer.aggregator.deal_certified());
+        let generator = GE::generator();
+        let s = generator.scalar_mul(&init_data.secret.get_element());
+        assert_eq!(s, dealer.secret_commit().unwrap());
+        // bad dealer response
+        dealer.aggregator.bad_dealer = true;
+        assert!(!dealer.aggregator.deal_certified());
+        assert!(dealer.secret_commit().is_err());
+        // inconsistent state on purpose
+        // too much complaints
+        for i in 0..dealer.aggregator.threshold {
+            dealer.aggregator.responses.insert(
+                i as u32,
+                Response {
+                    approved: false,
+                    ..Default::default()
+                },
+            );
+        }
+        assert!(!dealer.aggregator.deal_certified());
+    }
+
+    #[test]
+    fn test_vss_verifier_decrypt_deal() {
+        let init_data: InitData = setup(7);
+        let (dealer, mut verifiers) = gen_all(&init_data);
+        let d: &Deal = &dealer.deals[0];
+        let v: &mut Verifier = &mut verifiers[0];
+
+        // all fine
+        let mut enc_deal: EncryptedDeal = dealer.encrypt_deal(0).unwrap();
+        let dec_deal: Deal = v.decrypt_deal(&enc_deal).unwrap();
+        let d1: Vec<u8> = bincode::serialize(d).unwrap();
+        let d2: Vec<u8> = bincode::serialize(&dec_deal).unwrap();
+        assert!(bitwise_eq(&d1, &d2));
+
+        // wrong dh key
+        let correct_dh = enc_deal.dh_key;
+        enc_deal.dh_key = ECPoint::generator();
+        v.decrypt_deal(&enc_deal).expect_err("Wrong dh key");
+        enc_deal.dh_key = correct_dh;
+
+        // wrong signature
+        let correct_sig = enc_deal.signature.clone();
+        enc_deal.signature = custom_signature();
+        v.decrypt_deal(&enc_deal).expect_err("Wrong signature");
+
+        enc_deal.signature = correct_sig;
+
+        // wrong cipgertext
+        let correct_cipher = enc_deal.cipher.clone();
+        enc_deal.cipher = [0u8; 64].to_vec();
+        let dec_deal = v.decrypt_deal(&enc_deal);
+        assert!(dec_deal.is_err());
+        enc_deal.cipher = correct_cipher;
+    }
+
+    #[test]
+    fn test_vss_verifier_receive_deal_correct_deal() {
+        let init_data: InitData = setup(7);
+        let (dealer, mut verifiers) = gen_all(&init_data);
+        let unm_dealer = dealer.clone();
+        let v: &mut Verifier = &mut verifiers[0];
+
+        let enc_deal: EncryptedDeal = unm_dealer.encrypt_deal(0).unwrap();
+
+        let resp = v.process_encrypted_deal(&enc_deal).unwrap();
+        assert!(resp.approved);
+        assert_eq!(v.index, resp.index);
+        assert_eq!(dealer.session_id, resp.session_id);
+        let contx = resp.hash_self().unwrap();
+
+        sign::verify_signature(
+            &v.pub_k.get_element().to_bytes(),
+            &resp.signature,
+            &contx,
+            &v.index.to_le_bytes(),
+        )
+        .expect("Signature must be valid");
+
+        assert_eq!(resp, *v.aggregator.responses.get(&v.index).unwrap());
+    }
+
+    #[test]
+    fn test_vss_verifier_receive_deal_wrong_encryption() {
+        let init_data: InitData = setup(7);
+        let (dealer, mut verifiers) = gen_all(&init_data);
+        let v: &mut Verifier = &mut verifiers[0];
+
+        let mut enc_deal: EncryptedDeal = dealer.encrypt_deal(0).unwrap();
+
+        enc_deal.signature = custom_signature();
+        let resp = v.process_encrypted_deal(&enc_deal).is_err();
+        assert!(resp);
+    }
+
+    #[test]
+    fn test_vss_verifier_receive_deal_wrong_index() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, mut verifiers) = gen_all(&init_data);
+        let d: &mut Deal = &mut dealer.deals[0];
+        let v: &mut Verifier = &mut verifiers[0];
+
+        let correct_index = d.sec_share.i;
+        d.sec_share.i = correct_index + 1;
+        let enc_deal: EncryptedDeal = dealer.encrypt_deals().unwrap()[0].clone();
+        v.process_encrypted_deal(&enc_deal)
+            .expect_err("Incorrect share index");
+    }
+
+    #[test]
+    fn test_vss_verifier_receive_deal_wrong_commitments() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, mut verifiers) = gen_all(&init_data);
+        let unm_dealer = dealer.clone();
+        let d: &mut Deal = &mut dealer.deals[0];
+        let v: &mut Verifier = &mut verifiers[0];
+
+        let enc_deal: EncryptedDeal = unm_dealer.encrypt_deal(0).unwrap();
+        v.process_encrypted_deal(&enc_deal).expect("Must work fine");
+
+        let _ = d.commitments.remove(0 as usize);
+        let generator = GE::generator();
+        let priv1 = FE::from(7960 as u64);
+        let pub_1: GE = generator.scalar_mul(&priv1.get_element());
+        d.commitments
+            .insert(0 as usize, pub_1.get_element().to_bytes().to_vec());
+        let enc_deal: EncryptedDeal = dealer.encrypt_deal(0).unwrap();
+        v.process_encrypted_deal(&enc_deal)
+            .expect_err("Wrong committment");
+    }
+
+    #[test]
+    fn test_vss_verifier_receive_deal_already_seen_deal() {
+        let init_data: InitData = setup(7);
+        let (dealer, mut verifiers) = gen_all(&init_data);
+        let v: &mut Verifier = &mut verifiers[0];
+
+        let enc_deal: EncryptedDeal = dealer.encrypt_deal(0).unwrap();
+
+        v.process_encrypted_deal(&enc_deal)
+            .expect("First time work fine");
+        v.process_encrypted_deal(&enc_deal)
+            .expect_err("Already received this deal");
+    }
+
+    #[test]
+    fn test_vss_verifier_receive_deal_approval_already_exist() {
+        let init_data: InitData = setup(7);
+        let (dealer, mut verifiers) = gen_all(&init_data);
+        let v: &mut Verifier = &mut verifiers[0];
+
+        let enc_deal: EncryptedDeal = dealer.encrypt_deal(0).unwrap();
+
+        v.process_encrypted_deal(&enc_deal)
+            .expect("New deal, must work fine");
+        v.aggregator.deal.t = 0; // reset aggregator in such way
+
+        v.aggregator.responses.insert(
+            v.index,
+            Response {
+                approved: true,
+                ..Default::default()
+            },
+        );
+        v.process_encrypted_deal(&enc_deal)
+            .expect_err("Approval already exists");
+    }
+
+    #[test]
+    fn test_vss_verifier_receive_deal_valid_complaint() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, mut verifiers) = gen_all(&init_data);
+        let unm_dealer = dealer.clone();
+        let d: &mut Deal = &mut dealer.deals[0];
+        let v: &mut Verifier = &mut verifiers[0];
+
+        let enc_deal: EncryptedDeal = unm_dealer.encrypt_deal(0).unwrap();
+
+        v.process_encrypted_deal(&enc_deal).expect("Must work fine");
+
+        v.aggregator.deal.t = 0; // reset aggregator in such way
+        let _ = v.aggregator.responses.remove(&v.index).unwrap();
+        d.rnd_share.v = ECScalar::new_random();
+        let enc_deal: EncryptedDeal = dealer.encrypt_deal(0).unwrap();
+        let resp = v.process_encrypted_deal(&enc_deal).unwrap();
+        assert!(!resp.approved);
+    }
+
+    #[test]
+    fn test_vss_aggregator_verify_justification() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, mut verifiers) = gen_all(&init_data);
+        let d: &mut Deal = &mut dealer.deals[0];
+        let v: &mut Verifier = &mut verifiers[0];
+
+        let wrong_v = FE::new_random();
+        let good_d: Deal = d.clone();
+        d.sec_share.v = wrong_v;
+        let enc_deal: EncryptedDeal = dealer.encrypt_deals().unwrap()[0].clone();
+        let mut resp = v.process_encrypted_deal(&enc_deal).unwrap();
+
+        assert!(!resp.approved);
+        assert_eq!(Some(&resp), v.aggregator.responses.get(&v.index));
+
+        dealer.deals[0] = good_d;
+
+        let mut j: Justification = dealer.process_response(&resp).unwrap().unwrap();
+
+        // invalid deal justified
+        let good_v: FE = j.deal.sec_share.v;
+        j.deal.sec_share.v = FE::from(168 as u64);
+        v.process_justification(&j)
+            .expect_err("invalid deal justified");
+
+        assert!(v.aggregator.bad_dealer);
+
+        j.deal.sec_share.v = good_v;
+        v.aggregator.bad_dealer = false;
+
+        // valid complaint
+        v.process_justification(&j).expect("Valid complaint");
+
+        // invalid complaint
+        resp.session_id = [5u8; 32].to_vec();
+        dealer
+            .process_response(&resp)
+            .expect_err("Can't process response with invalid complaint");
+
+        // no complaints for this justification before
+        v.aggregator.responses.remove(&v.index);
+        v.process_justification(&j)
+            .expect_err("no complaints for this justification before");
+    }
+
+    #[test]
+    fn test_vss_aggregator_verify_response_duplicate() {
+        let init_data: InitData = setup(7);
+        let (dealer, verifiers) = gen_all(&init_data);
+
+        let mut v0: Verifier = verifiers[0].clone();
+        let mut v1: Verifier = verifiers[1].clone();
+
+        let enc_deals: Vec<EncryptedDeal> = dealer.encrypt_deals().unwrap();
+
+        let d0: &EncryptedDeal = &enc_deals[0];
+        let d1: &EncryptedDeal = &enc_deals[1];
+
+        let resp0: Response = v0.process_encrypted_deal(&d0).unwrap();
+
+        assert!(resp0.approved);
+
+        let resp1: Response = v1.process_encrypted_deal(&d1).unwrap();
+
+        assert!(resp1.approved);
+
+        v0.process_response(&resp1).expect("Must work fine");
+
+        assert_eq!(v0.aggregator.responses.get(&v1.index).unwrap(), &resp1);
+
+        v0.process_response(&resp1)
+            .expect_err("Already processed response");
+
+        v0.aggregator.responses.insert(
+            v1.index,
+            Response {
+                approved: true,
+                ..Default::default()
+            },
+        );
+        v0.process_response(&resp1).expect_err("Must fail");
+    }
+
+    #[test]
+    fn test_vss_aggregator_verify_response() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, mut verifiers) = gen_all(&init_data);
+
+        let v: &mut Verifier = &mut verifiers[0];
+
+        let (wrong_sec, _) = gen_pair();
+        dealer.deals[0].sec_share.v = wrong_sec;
+
+        let enc_deal: EncryptedDeal = dealer.encrypt_deal(0).unwrap();
+
+        // valid complaint
+        let mut resp = v.process_encrypted_deal(&enc_deal).unwrap();
+
+        assert!(!resp.approved);
+        assert_eq!(resp.session_id, dealer.session_id);
+
+        let r = v.aggregator.responses.get(&v.index).unwrap();
+
+        assert!(!r.approved);
+
+        // wrong index
+        resp.index = 45;
+        let r_hash = Response::hash(&resp.session_id.to_vec(), resp.index, false as u32).unwrap();
+        let sig: Vec<u8> = sign::sign_msg(
+            v.longterm.get_element().to_bytes(),
+            v.pub_k.get_element().to_bytes(),
+            &r_hash,
+            &v.index.to_le_bytes(),
+        )
+        .unwrap();
+        resp.signature = sig;
+        let r = v.aggregator.verify_response(&resp);
+
+        assert!(r.is_err());
+
+        resp.index = 0;
+
+        // wrong signature
+        let good_sig = resp.signature.clone();
+        resp.signature = sign::sign_msg(
+            v.longterm.get_element().to_bytes(),
+            v.pub_k.get_element().to_bytes(),
+            &[0u8; 32],
+            &v.index.to_le_bytes(),
+        )
+        .unwrap();
+        v.aggregator
+            .verify_response(&resp)
+            .expect_err("Wrong signature");
+
+        resp.signature = good_sig;
+
+        // wrong ID
+        let wrong_id = [0u8; 32].to_vec();
+        resp.session_id = wrong_id;
+        v.aggregator.verify_response(&resp).expect_err("Wrong ID");
+    }
+
+    #[test]
+    fn test_vss_aggregator_verify_deal() {
+        let init_data: InitData = setup(7);
+        let (dealer, verifiers) = gen_all(&init_data);
+
+        let mut deal: Deal = dealer.deals[0].clone();
+
+        deal.verify(&dealer.aggregator.verifiers, &deal.session_id)
+            .expect("Must work fine");
+
+        // wrong T
+        let correct_t = deal.t;
+        deal.t = 1;
+        deal.verify(&dealer.aggregator.verifiers, &deal.session_id)
+            .expect_err("wrong threshold");
+
+        deal.t = correct_t;
+
+        // wrong SessionID
+        let correct_sid = deal.session_id.clone();
+        deal.session_id = [0u8; 32].to_vec();
+        deal.verify(&dealer.aggregator.verifiers, &correct_sid)
+            .expect_err("Wrong SessionId");
+
+        deal.session_id = correct_sid;
+
+        // index different in one share
+        let correct_ind = deal.rnd_share.i;
+        deal.rnd_share.i = correct_ind + 1;
+        deal.verify(&dealer.aggregator.verifiers, &deal.session_id)
+            .expect_err("index different in one share");
+
+        deal.rnd_share.i = correct_ind;
+
+        // index not in bounds
+        let correct_i = deal.sec_share.i;
+        deal.sec_share.i = verifiers.len() as u32;
+        deal.verify(&dealer.aggregator.verifiers, &deal.session_id)
+            .expect_err("index not in bounds");
+
+        deal.sec_share.i = correct_i;
+
+        // shares invalid in respect to the commitments
+        let (wrong_sec, _) = gen_pair();
+        deal.sec_share.v = wrong_sec;
+        deal.verify(&dealer.aggregator.verifiers, &deal.session_id)
+            .expect_err("shares invalid in respect to the commitments");
+    }
+
+    #[test]
+    fn test_vss_aggregator_add_complaint() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, _) = gen_all(&init_data);
+
+        let resp: Response = Response {
+            approved: false,
+            index: 1,
+            ..Default::default()
+        };
+        dealer
+            .aggregator
+            .add_response(&resp)
+            .expect("Must work fine");
+
+        assert_eq!(&resp, dealer.aggregator.responses.get(&1).unwrap());
+
+        // response already there
+        dealer
+            .aggregator
+            .add_response(&resp)
+            .expect_err("response already there");
+    }
+
+    #[test]
+    fn test_vss_aggregator_clean_verifiers() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, _) = gen_all(&init_data);
+
+        for el in 0..dealer.t {
+            dealer.aggregator.responses.insert(
+                el,
+                Response {
+                    approved: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert!(dealer.aggregator.enough_approvals());
+
+        assert!(!dealer.aggregator.deal_certified());
+
+        dealer.aggregator.clean_verifiers();
+
+        assert!(dealer.aggregator.deal_certified());
+    }
+
+    #[test]
+    fn test_vss_dealer_set_timeout() {
+        let init_data: InitData = setup(7);
+        let (mut dealer, _) = gen_all(&init_data);
+
+        for el in 0..dealer.t {
+            dealer.aggregator.responses.insert(
+                el,
+                Response {
+                    approved: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert!(dealer.aggregator.enough_approvals());
+
+        assert!(!dealer.aggregator.deal_certified());
+
+        dealer.set_timeout();
+
+        assert!(dealer.aggregator.deal_certified());
+    }
+
+    #[test]
+    fn test_vss_verifier_set_timeout() {
+        let init_data: InitData = setup(7);
+        let (dealer, mut verifiers) = gen_all(&init_data);
+
+        let v: &mut Verifier = &mut verifiers[0];
+
+        let enc_deal: EncryptedDeal = dealer.encrypt_deal(0).unwrap();
+
+        v.process_encrypted_deal(&enc_deal).unwrap();
+
+        for el in 0..v.aggregator.threshold {
+            v.aggregator.responses.insert(
+                el,
+                Response {
+                    approved: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        assert!(v.aggregator.enough_approvals());
+
+        assert!(!v.aggregator.deal_certified());
+
+        v.set_timeout();
+
+        assert!(v.aggregator.deal_certified());
+    }
+
+    #[test]
+    fn test_vss_session_id() {
+        let init_data: InitData = setup(7);
+        let (dealer, _) = gen_all(&init_data);
+
+        let commitments: Vec<Vec<u8>> = dealer.deals[0].commitments.clone();
+        let sid0: [u8; 32] = session_id(
+            &init_data.dealer_pub,
+            &init_data.verifiers_pub,
+            &commitments,
+            dealer.t,
+        );
+
+        let sid1: [u8; 32] = session_id(
+            &init_data.dealer_pub,
+            &init_data.verifiers_pub,
+            &commitments,
+            dealer.t,
+        );
+
+        assert_eq!(&sid0, &sid1);
+
+        let wrong_point = dealer
+            .pub_key
+            .add_point(&init_data.dealer_pub.get_element());
+
+        let sid2: [u8; 32] = session_id(
+            &wrong_point,
+            &init_data.verifiers_pub,
+            &commitments,
+            dealer.t,
+        );
+
+        assert_ne!(&sid1, &sid2);
+    }
+
+    #[test]
+    fn test_vss_dh_exchange() {
+        let generator = GE::generator();
+        let priv1 = FE::from(168 as u64);
+        let dh = dh_exchange(&priv1, &generator);
+        let point = generator.scalar_mul(&priv1.get_element());
+
+        assert_eq!(dh, point);
+    }
+
+    #[test]
+    fn test_vss_context() {
+        let init_data: InitData = setup(7);
+        let c = context(&init_data.dealer_pub, &init_data.verifiers_pub);
+
+        assert_eq!(128 as usize, c.len());
+    }
+
+    #[test]
+    fn test_derive_h() {
+        let generator = GE::generator();
+
+        let priv1 = FE::from(168 as u64);
+        let priv2 = FE::from(54 as u64);
+        let priv3 = FE::from(8902 as u64);
+        let priv4 = FE::from(4890 as u64);
+        let priv5 = FE::from(5109 as u64);
+        let priv6 = FE::from(7960 as u64);
+
+        let pub_1: GE = generator.scalar_mul(&priv1.get_element());
+        let pub_2: GE = generator.scalar_mul(&priv2.get_element());
+        let pub3: GE = generator.scalar_mul(&priv3.get_element());
+        let pub4: GE = generator.scalar_mul(&priv4.get_element());
+        let pub5: GE = generator.scalar_mul(&priv5.get_element());
+        let pub6: GE = generator.scalar_mul(&priv6.get_element());
+
+        let some_vec: Vec<GE> = vec![pub_1, pub_2, pub3, pub4, pub5, pub6];
+        derive_h(&some_vec).unwrap();
+    }
+}
