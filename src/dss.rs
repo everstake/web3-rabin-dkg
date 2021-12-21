@@ -289,3 +289,280 @@ fn session_id(a: &DistKeyShare, b: &DistKeyShare) -> [u8; 32] {
         .try_into()
         .expect("Slice with incorrect length")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::curve_traits;
+    use crate::ristretto_curve;
+    use curve_traits::{ECPoint, ECScalar};
+    use dkg::*;
+    use ristretto_curve::{FE, GE};
+    use schnorrkel::context::signing_context;
+    use schnorrkel::keys::Keypair;
+    use schnorrkel::Signature;
+
+    struct InitData {
+        nb_verifiers: u32,
+        parts_pub: Vec<GE>,
+        parts_sec: Vec<FE>,
+        longterms: Vec<DistKeyShare>,
+        randoms: Vec<DistKeyShare>,
+        dss: Vec<DSS>,
+    }
+
+    fn setup(nb_verifiers: u32) -> InitData {
+        let mut parts_sec: Vec<FE> = Vec::new();
+        let mut parts_pub: Vec<GE> = Vec::new();
+
+        for _ in 0..nb_verifiers {
+            let (scalar, point) = gen_pair();
+            parts_sec.push(scalar);
+            parts_pub.push(point);
+        }
+
+        let longterms: Vec<DistKeyShare> = gen_dist_secret(&parts_sec, &parts_pub, nb_verifiers);
+        let randoms: Vec<DistKeyShare> = gen_dist_secret(&parts_sec, &parts_pub, nb_verifiers);
+
+        InitData {
+            nb_verifiers,
+            parts_pub,
+            parts_sec,
+            longterms,
+            randoms,
+            dss: Vec::new(),
+        }
+    }
+
+    fn gen_pair() -> (FE, GE) {
+        let generator = GE::generator();
+        let g_scalar: FE = ECScalar::new_random();
+        let g_point: GE = generator.scalar_mul(&g_scalar.get_element());
+        (g_scalar, g_point)
+    }
+
+    fn gen_dist_secret(
+        parts_sec: &[FE],
+        parts_pub: &[GE],
+        participants_count: u32,
+    ) -> Vec<DistKeyShare> {
+        let mut dkgs: Vec<DistKeyGenerator> = Vec::new();
+        for ind in 0..participants_count {
+            let dkg: DistKeyGenerator = DistKeyGenerator::new(
+                parts_sec[ind as usize],
+                parts_pub.to_vec(),
+                participants_count / 2 + 1,
+            )
+            .unwrap();
+            dkgs.push(dkg);
+        }
+        // full secret sharing exchange
+        // 1. broadcast deals
+        let mut resps: Vec<Response> = Vec::new();
+        for i in 0..participants_count {
+            let deals = dkgs[i as usize].deals().unwrap();
+            for (&j, deal) in deals.iter() {
+                let resp: Response = dkgs[j as usize].process_deal(deal).unwrap();
+
+                assert!(resp.response.approved);
+
+                resps.push(resp);
+            }
+        }
+        // 2. Broadcast responses
+        for r in resps.iter() {
+            for ind in 0..participants_count {
+                let dkg: &mut DistKeyGenerator = &mut dkgs[ind as usize];
+                if r.response.index != dkg.index() {
+                    let j = dkg.process_response(r).unwrap();
+
+                    assert!(j.is_none());
+                }
+            }
+        }
+        // 3. Broadcast secret commitment
+        for ind in 0..participants_count as usize {
+            let scs: SecretCommits = dkgs[ind].secret_commits().unwrap();
+            for (ind2, dkg2) in dkgs.iter_mut().enumerate() {
+                if ind == ind2 {
+                    continue;
+                }
+                let cc = dkg2.process_secret_commit(&scs).unwrap().is_none();
+
+                assert!(cc);
+            }
+        }
+
+        // 5. reveal shares
+        dkgs.iter()
+            .map(DistKeyGenerator::dist_key_share)
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn get_dss(i: u32, init_data: &InitData) -> DSS {
+        DSS::new(
+            init_data.parts_sec[i as usize],
+            init_data.parts_pub.clone(),
+            init_data.longterms[i as usize].clone(),
+            init_data.randoms[i as usize].clone(),
+            b"hello DSS".to_vec(),
+            init_data.nb_verifiers / 2 + 1,
+        )
+        .expect("Failed to create DSS")
+    }
+
+    fn custom_signature() -> Vec<u8> {
+        let keypair: Keypair = Keypair::generate_with(utils::rand_hack());
+        let context = signing_context(b"some context");
+        let message: &[u8] = b"Very secret message";
+        let signature: Signature = keypair.sign(context.bytes(message));
+        signature.to_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_dss_new() {
+        let init_data: InitData = setup(7);
+
+        DSS::new(
+            init_data.parts_sec[0],
+            init_data.parts_pub.clone(),
+            init_data.longterms[0].clone(),
+            init_data.randoms[0].clone(),
+            b"hello DSS".to_vec(),
+            4,
+        )
+        .expect("Must work fine, correct secret");
+
+        DSS::new(
+            ECScalar::new_random(),
+            init_data.parts_pub.clone(),
+            init_data.longterms[0].clone(),
+            init_data.randoms[0].clone(),
+            b"hello DSS".to_vec(),
+            4,
+        )
+        .expect_err("Must fail, incorrect secret");
+    }
+
+    #[test]
+    fn test_dss_partial_sigs() {
+        let init_data: InitData = setup(7);
+
+        let mut dss0: DSS = get_dss(0, &init_data);
+        let mut dss1: DSS = get_dss(1, &init_data);
+
+        dss0.partial_sig().unwrap();
+        assert_eq!(1, dss0.partials.len());
+        // second time should not affect list
+        let mut ps0: PartialSig = dss0.partial_sig().unwrap();
+
+        assert_eq!(1, dss0.partials.len());
+
+        // wrong index
+        let correct_i: u32 = ps0.partial.i;
+        ps0.partial.i = 100;
+        dss1.process_partial_sig(&ps0)
+            .expect_err("Must fail with wrong index");
+
+        ps0.partial.i = correct_i;
+
+        // wrong signature
+        let correct_sig = ps0.signature.clone();
+        ps0.signature = custom_signature();
+        dss1.process_partial_sig(&ps0)
+            .expect_err("Must fail with wrong signature");
+
+        ps0.signature = correct_sig.clone();
+
+        // invalid partial sig
+        let correct_v = ps0.partial.v;
+        ps0.partial.v = ECScalar::new_random();
+        let msg: [u8; 32] = PartialSig::hash(&ps0.partial, &ps0.session_id).unwrap();
+
+        let signature = sign::sign_msg(
+            dss0.secret.get_element().to_bytes(),
+            dss0.public.get_element().to_bytes(),
+            &msg,
+            &dss0.index.to_le_bytes(),
+        )
+        .unwrap();
+        ps0.signature = signature;
+
+        dss1.process_partial_sig(&ps0)
+            .expect_err("Must fail with invalid partial sig");
+
+        ps0.partial.v = correct_v;
+        ps0.signature = correct_sig;
+
+        dss1.process_partial_sig(&ps0).expect("Must work fine");
+
+        dss1.process_partial_sig(&ps0)
+            .expect_err("Must fail, partial sig already received");
+
+        dss1.signature()
+            .expect_err("Must fail, if not enough partial signatures, can't generate signature");
+
+        // enough partial sigs ?
+        for i in 2..init_data.nb_verifiers {
+            let mut dss = get_dss(i, &init_data);
+            let ps: PartialSig = dss.partial_sig().unwrap();
+
+            dss1.process_partial_sig(&ps).expect("Must work fine");
+        }
+
+        assert!(dss1.enough_partial_sigs());
+    }
+
+    #[test]
+    fn test_dss_signature() {
+        let mut init_data: InitData = setup(7);
+
+        let mut pss: Vec<PartialSig> = Vec::new();
+
+        for ind in 0..init_data.nb_verifiers {
+            let mut dss = get_dss(ind, &init_data);
+            let part_sig = dss.partial_sig().unwrap();
+            init_data.dss.push(dss);
+            pss.push(part_sig);
+        }
+        for ind in 0..init_data.nb_verifiers {
+            let dss = init_data.dss.get_mut(ind as usize).unwrap();
+            for (i, k) in pss.iter().enumerate() {
+                if ind != i as u32 {
+                    let err = dss.process_partial_sig(k).is_ok();
+                    assert!(err);
+                }
+            }
+        }
+        let dss0: &mut DSS = init_data.dss.get_mut(0 as usize).unwrap();
+        let sig = dss0.signature().unwrap();
+
+        let verif = verify(
+            init_data
+                .longterms
+                .get(0 as usize)
+                .unwrap()
+                .get_public_key(),
+            &dss0.msg,
+            sig.as_ref(),
+        )
+        .unwrap();
+
+        assert!(verif);
+
+        let sig = custom_signature();
+        let verif = verify(
+            init_data
+                .longterms
+                .get(0 as usize)
+                .unwrap()
+                .get_public_key(),
+            &dss0.msg,
+            sig.as_ref(),
+        )
+        .unwrap();
+
+        assert!(!verif);
+    }
+}
