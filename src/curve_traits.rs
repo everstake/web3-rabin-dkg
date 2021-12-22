@@ -1,11 +1,11 @@
+use std::convert::From;
 use std::error::Error;
 
-pub trait ECScalar<SK> {
+pub trait ECScalar<SK>: From<u64> + From<SK> {
     fn new_random() -> Self;
     fn zero() -> Self;
     fn get_element(&self) -> SK;
     fn set_element(&mut self, element: SK);
-    fn from(n: u64) -> Self;
     fn to_hex(&self) -> String;
     fn add(&self, other: &SK) -> Self;
     fn mul(&self, other: &SK) -> Self;
