@@ -705,3 +705,753 @@ impl ReconstructCommits {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::curve_traits;
+    use crate::poly;
+    use crate::ristretto_curve;
+    use curve_traits::{ECPoint, ECScalar};
+    use ristretto_curve::{FE, GE};
+    use schnorrkel::context::signing_context;
+    use schnorrkel::{Keypair, Signature};
+
+    struct InitData {
+        parts_pub: Vec<GE>,
+        parts_sec: Vec<FE>,
+        dkgs: Vec<DistKeyGenerator>,
+    }
+
+    fn setup(nb_verifiers: u32) -> InitData {
+        let mut parts_sec: Vec<FE> = Vec::new();
+        let mut parts_pub: Vec<GE> = Vec::new();
+        for _ in 0..nb_verifiers {
+            let (scalar, point) = gen_pair();
+            parts_sec.push(scalar);
+            parts_pub.push(point);
+        }
+        let dkgs: Vec<DistKeyGenerator> =
+            dkg_gen(parts_sec.clone(), parts_pub.clone(), nb_verifiers);
+        InitData {
+            parts_pub,
+            parts_sec,
+            dkgs,
+        }
+    }
+
+    fn gen_pair() -> (FE, GE) {
+        let generator = GE::generator();
+        let g_scalar: FE = ECScalar::new_random();
+        let g_point: GE = generator.scalar_mul(&g_scalar.get_element());
+        (g_scalar, g_point)
+    }
+
+    fn dkg_gen(
+        participants_sec: Vec<FE>,
+        participants_pub: Vec<GE>,
+        patricipants_count: u32,
+    ) -> Vec<DistKeyGenerator> {
+        participants_sec
+            .iter()
+            .map(|sec| {
+                DistKeyGenerator::new(*sec, participants_pub.clone(), patricipants_count / 2 + 1)
+            })
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn full_exchange(participants: &mut Vec<DistKeyGenerator>, all_participants: u32) {
+        // full secret sharing exchange
+        // 1. broadcast deals
+        let mut resps: Vec<Response> = Vec::new();
+        for dkg_ind in 0..all_participants as usize {
+            let deals = participants[dkg_ind].deals().unwrap();
+            for (&i, deal) in deals.iter() {
+                let resp: Response = participants[i as usize].process_deal(deal).unwrap();
+
+                assert!(resp.response.approved);
+
+                resps.push(resp);
+            }
+        }
+        // 2. broadcast response
+        for r in resps.iter() {
+            for dkg in participants.iter_mut() {
+                if r.response.index != dkg.index {
+                    let justification = dkg.process_response(r).unwrap();
+
+                    assert!(justification.is_none());
+                }
+            }
+        }
+        // 3. make sure everyone has the same QUAL set
+        for dkg1 in participants.iter() {
+            for dkg2 in participants.iter() {
+                assert!(dkg1.is_in_qual(dkg2.index));
+            }
+        }
+    }
+
+    fn custom_signature() -> Vec<u8> {
+        let keypair: Keypair = Keypair::generate_with(utils::rand_hack());
+        let context = signing_context(b"some context");
+        let message: &[u8] = b"Very secret message";
+        let signature: Signature = keypair.sign(context.bytes(message));
+        signature.to_bytes().to_vec()
+    }
+
+    #[test]
+    fn test_dkg_new_dist_key_generator() {
+        let participants_count: u32 = 7;
+        let init_data = setup(participants_count);
+
+        let long: FE = init_data.parts_sec[0];
+        let mut dkg_gen = DistKeyGenerator::new(
+            long,
+            init_data.parts_pub.clone(),
+            participants_count / 2 + 1,
+        )
+        .unwrap();
+
+        dkg_gen.secret_commits().unwrap_err();
+
+        let (secret, _) = gen_pair();
+        DistKeyGenerator::new(secret, init_data.parts_pub, participants_count / 2 + 1).unwrap_err();
+    }
+
+    #[test]
+    fn test_dkg_deal() {
+        let participants_count: u32 = 7;
+        let mut init_data = setup(participants_count);
+
+        let dkg: &mut DistKeyGenerator = init_data.dkgs.get_mut(0 as usize).unwrap();
+        let dks = dkg.dist_key_share().is_err();
+
+        assert!(dks);
+
+        let deals = dkg.deals().unwrap();
+
+        assert_eq!(deals.len(), (participants_count - 1) as usize);
+
+        for (_, deal) in deals.iter() {
+            assert_eq!(0, deal.index);
+        }
+
+        let v = dkg.verifiers.get(&dkg.index);
+        assert!(v.is_some());
+    }
+
+    #[test]
+    fn test_dkg_process_deal() {
+        let participants_count: u32 = 7;
+        let mut init_data = setup(participants_count);
+        let dkg: &mut DistKeyGenerator = init_data.dkgs.get_mut(0 as usize).unwrap();
+        let deals = dkg.deals().unwrap();
+
+        let rec: &mut DistKeyGenerator = init_data.dkgs.get_mut(1 as usize).unwrap();
+        let mut deal: Deal = deals.get(&1).unwrap().clone();
+
+        assert_eq!(0, deal.index);
+        assert_eq!(1, rec.index);
+
+        // verifier don't find itself
+        let correct_p: Vec<GE> = rec.participants.clone();
+        rec.participants = Vec::new();
+        let resp = rec.process_deal(&deal).is_err();
+
+        assert!(resp);
+
+        rec.participants = correct_p;
+
+        // good deal
+        let resp = rec.process_deal(&deal).unwrap();
+
+        assert!(resp.response.approved);
+
+        let verif = rec.verifiers.get(&deal.index);
+
+        assert!(verif.is_some());
+        assert_eq!(0, resp.index);
+
+        // duplicate
+        let resp = rec.process_deal(&deal);
+
+        assert!(resp.is_err());
+
+        // wrong index
+        let correct_idx: u32 = deal.index;
+        deal.index = participants_count + 1;
+        let resp = rec.process_deal(&deal);
+
+        assert!(resp.is_err());
+
+        deal.index = correct_idx;
+
+        // wrong deal
+        deal.deal.signature = custom_signature();
+        let resp = rec.process_deal(&deal);
+
+        assert!(resp.is_err());
+    }
+
+    #[test]
+    fn test_dkg_process_response() {
+        let participants_count: u32 = 7;
+        let init_data = setup(participants_count);
+
+        let mut dkg: DistKeyGenerator = init_data.dkgs[0 as usize].clone();
+        let idx_rec: u32 = 1;
+        let mut rec: DistKeyGenerator = init_data.dkgs[idx_rec as usize].clone();
+
+        // give a wrong deal
+        let correct_secret: FE = dkg.dealer.deals[idx_rec as usize].rnd_share.v;
+        dkg.dealer.deals[idx_rec as usize].rnd_share.v = ECScalar::zero();
+        let dd = dkg.deals().unwrap();
+        let enc_d: &Deal = dd.get(&idx_rec).unwrap();
+        let mut resp: Response = rec.process_deal(enc_d).unwrap();
+
+        assert!(!resp.response.approved);
+
+        dkg.dealer.deals[idx_rec as usize].rnd_share.v = correct_secret;
+
+        // no verifier tied to Response
+        let v: vssVerifier = dkg.verifiers.get(&0).unwrap().clone();
+        dkg.verifiers.remove(&0);
+        let j = dkg.process_response(&resp);
+
+        assert!(j.is_err());
+
+        dkg.verifiers.insert(0, v);
+
+        // invalid response
+        let correct_sig: Vec<u8> = resp.response.signature.clone();
+        resp.response.signature = custom_signature();
+        let j = dkg.process_response(&resp);
+
+        assert!(j.is_err());
+
+        resp.response.signature = correct_sig;
+
+        // valid complaint from our deal
+        dkg.process_response(&resp).unwrap();
+
+        // valid complaint from another deal from another peer
+        let mut dkg2: DistKeyGenerator = init_data.dkgs[2].clone();
+        let correct_secret: FE = dkg2.dealer.deals[idx_rec as usize].rnd_share.v;
+        dkg2.dealer.deals[idx_rec as usize].rnd_share.v = ECScalar::zero();
+        let deals2 = dkg2.deals().unwrap();
+
+        let deal12: &Deal = deals2.get(&idx_rec).unwrap();
+        let mut resp12: Response = rec.process_deal(deal12).unwrap();
+
+        assert!(!resp12.response.approved);
+
+        dkg2.dealer.deals[idx_rec as usize].rnd_share.v = correct_secret;
+        let deals2 = dkg2.deals().unwrap();
+
+        // give it to the first peer
+        // process dealer 2's deal
+        let deal2: &Deal = deals2.get(&0).unwrap();
+        dkg.process_deal(deal2).unwrap();
+
+        // process response from peer 1
+        let j = dkg.process_response(&resp12).unwrap();
+
+        assert!(j.is_none());
+
+        // Justification part:
+        // give the complaint to the dealer
+        let j = dkg2.process_response(&resp12).unwrap();
+
+        assert!(j.is_some());
+
+        let j: Justification = j.unwrap();
+
+        resp12.response.approved = false;
+        dkg.process_justification(&j).unwrap();
+
+        // remove verifiers
+        dkg.verifiers.remove(&0);
+        let err = dkg.process_justification(&j);
+
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_dkg_secret_commits() {
+        let participants_count: u32 = 7;
+        let init_data = setup(participants_count);
+
+        let mut dkgs: Vec<DistKeyGenerator> = init_data.dkgs;
+        full_exchange(&mut dkgs, participants_count);
+
+        let mut dkg: DistKeyGenerator = dkgs[0].clone();
+
+        let mut sc: SecretCommits = dkg.secret_commits().unwrap();
+        let msg: [u8; 32] = SecretCommits::hash(&sc.commitments, sc.index).unwrap();
+
+        sign::verify_signature(
+            dkg.pub_key.get_element().to_bytes().as_ref(),
+            sc.signature.as_ref(),
+            msg.as_ref(),
+            sc.index.to_le_bytes().as_ref(),
+        )
+        .expect("Signature must be valid");
+
+        // wrong index
+        let mut dkg2: DistKeyGenerator = dkgs.get(1 as usize).unwrap().clone();
+        let correct_idx: u32 = sc.index;
+        sc.index = participants_count + 1;
+        let cc = dkg2.process_secret_commit(&sc);
+
+        assert!(cc.is_err());
+
+        sc.index = correct_idx;
+
+        // not in qual: delete the verifier
+        let correct_v = dkg2.verifiers.get(&0).unwrap().clone();
+        dkg2.verifiers.remove(&0);
+        let cc = dkg2.process_secret_commit(&sc);
+
+        assert!(cc.is_err());
+
+        dkg2.verifiers.insert(0, correct_v);
+
+        // invalid sig
+        let correct_sig: Vec<u8> = sc.signature.clone();
+        sc.signature = custom_signature();
+        let cc = dkg2.process_secret_commit(&sc);
+
+        assert!(cc.is_err());
+
+        sc.signature = correct_sig;
+
+        // invalid session id
+        let correct_sid: Vec<u8> = sc.session_id.clone();
+        sc.session_id = [0u8; 32].to_vec();
+        let cc = dkg2.process_secret_commit(&sc);
+
+        assert!(cc.is_err());
+
+        sc.session_id = correct_sid;
+
+        // wrong commitments
+        let correct_point: Vec<u8> = sc.commitments.get(0 as usize).unwrap().clone();
+        let generator = GE::generator();
+        sc.commitments.remove(0 as usize);
+        sc.commitments
+            .insert(0 as usize, generator.get_element().to_bytes().to_vec());
+        let msg: [u8; 32] = SecretCommits::hash(&sc.commitments, sc.index).unwrap();
+        let signature = sign::sign_msg(
+            dkg.long.get_element().to_bytes(),
+            dkg.pub_key.get_element().to_bytes(),
+            &msg,
+            &sc.index.to_le_bytes(),
+        )
+        .unwrap();
+        let correct_sig: Vec<u8> = sc.signature.clone();
+        sc.signature = signature;
+        let cc = dkg2.process_secret_commit(&sc);
+
+        assert!(cc.is_ok());
+
+        sc.commitments.remove(0 as usize);
+        sc.commitments.insert(0 as usize, correct_point);
+        sc.signature = correct_sig;
+
+        // all fine
+        let cc = dkg2.process_secret_commit(&sc);
+
+        assert!(cc.is_ok());
+    }
+
+    #[test]
+    fn test_dkg_complaint_commits() {
+        let participants_count: u32 = 7;
+        let init_data = setup(participants_count);
+
+        let mut dkgs: Vec<DistKeyGenerator> = init_data.dkgs;
+        full_exchange(&mut dkgs, participants_count);
+
+        let mut scs: Vec<SecretCommits> = Vec::new();
+
+        for ind in 0..dkgs.len() {
+            let dkg: &mut DistKeyGenerator = dkgs.get_mut(ind as usize).unwrap();
+            let sc: SecretCommits = dkg.secret_commits().unwrap();
+            scs.push(sc);
+        }
+
+        for sc in scs.iter() {
+            for ind in 0..dkgs.len() {
+                let dkg: &mut DistKeyGenerator = dkgs.get_mut(ind as usize).unwrap();
+                dkg.process_secret_commit(sc).unwrap();
+            }
+        }
+
+        // change the sc for the second one
+        let mut commits: Vec<Vec<u8>> = scs.get(0 as usize).unwrap().commitments.clone();
+        let generator = GE::generator();
+        commits.remove(0 as usize);
+        commits.insert(0 as usize, generator.get_element().to_bytes().to_vec());
+        let msg: [u8; 32] = SecretCommits::hash(&commits, scs[0].index).unwrap();
+        let temp_dkg: DistKeyGenerator = dkgs.get(0 as usize).unwrap().clone();
+        let signature = sign::sign_msg(
+            temp_dkg.long.get_element().to_bytes(),
+            temp_dkg.pub_key.get_element().to_bytes(),
+            &msg,
+            &scs.get(0 as usize).unwrap().index.to_le_bytes(),
+        )
+        .unwrap();
+        let wrong_sc = SecretCommits {
+            index: scs.get(0 as usize).unwrap().index,
+            commitments: commits,
+            session_id: scs.get(0 as usize).unwrap().session_id.clone(),
+            signature,
+        };
+
+        let mut dkg: DistKeyGenerator = dkgs.get(1 as usize).unwrap().clone();
+        let mut cc: ComplaintCommits = dkg.process_secret_commit(&wrong_sc).unwrap().unwrap();
+
+        // ComplaintCommits: wrong index
+        let mut dkg2: DistKeyGenerator = dkgs.get(2 as usize).unwrap().clone();
+        let correct_index = cc.index;
+        cc.index = participants_count;
+        let rc = dkg2.process_complaints_commits(&cc);
+
+        assert!(rc.is_err());
+
+        cc.index = correct_index;
+
+        // invalid signature
+        let correct_sig = cc.signature.clone();
+        cc.signature = custom_signature();
+        let rc = dkg2.process_complaints_commits(&cc);
+
+        assert!(rc.is_err());
+
+        cc.signature = correct_sig;
+
+        // no verifiers
+        let v = dkg2.verifiers.get(&0).unwrap().clone();
+        dkg2.verifiers.remove(&0);
+        let rc = dkg2.process_complaints_commits(&cc);
+
+        assert!(rc.is_err());
+
+        dkg2.verifiers.insert(0, v);
+
+        // deal does not verify
+        let rc = dkg2.process_complaints_commits(&cc);
+
+        assert!(rc.is_err());
+
+        // no commitments
+        let sc = dkg2.commitments.get(&0).unwrap().clone();
+        dkg2.commitments.remove(&0);
+        let rc = dkg2.process_complaints_commits(&cc);
+
+        assert!(rc.is_err());
+
+        dkg2.commitments.insert(0, sc);
+
+        // secret commits are passing the check
+        let rc = dkg2.process_complaints_commits(&cc);
+
+        assert!(rc.is_err());
+    }
+
+    #[test]
+    fn test_dkg_reconstruct_commits() {
+        let participants_count: u32 = 7;
+        let init_data = setup(participants_count);
+
+        let mut dkgs: Vec<DistKeyGenerator> = init_data.dkgs;
+        full_exchange(&mut dkgs, participants_count);
+
+        let mut scs: Vec<SecretCommits> = Vec::new();
+
+        for ind in 0..dkgs.len() {
+            let dkg: &mut DistKeyGenerator = dkgs.get_mut(ind as usize).unwrap();
+            let sc: SecretCommits = dkg.secret_commits().unwrap();
+            scs.push(sc);
+        }
+
+        for sc in scs.iter() {
+            for ind in 2..dkgs.len() {
+                let dkg: &mut DistKeyGenerator = dkgs.get_mut(ind as usize).unwrap();
+                dkg.process_secret_commit(sc).unwrap();
+            }
+        }
+
+        // peer 1 wants to reconstruct coeffs from dealer 1
+        let mut temp_dkg: DistKeyGenerator = dkgs.get(1 as usize).unwrap().clone();
+        let share: vssDeal = temp_dkg.verifiers.get_mut(&0).unwrap().get_deal().unwrap();
+        let msg = ReconstructCommits::hash(1, 0, &share.sec_share).unwrap();
+        let signature = sign::sign_msg(
+            temp_dkg.long.get_element().to_bytes(),
+            temp_dkg.pub_key.get_element().to_bytes(),
+            &msg,
+            &temp_dkg.index.to_le_bytes(),
+        )
+        .unwrap();
+        let mut rc = ReconstructCommits {
+            session_id: share.session_id.clone(),
+            index: 1,
+            dealer_index: 0,
+            share: share.sec_share,
+            signature,
+        };
+
+        // reconstructed already set
+        let mut dkg2: DistKeyGenerator = dkgs.get(2 as usize).unwrap().clone();
+        dkg2.reconstructed.insert(0);
+        let reconstr = dkg2.process_reconstruct_commits(&rc);
+
+        assert!(reconstr.is_ok());
+
+        dkg2.reconstructed.remove(&0);
+
+        // commitments not invalidated by any comlaints
+        let reconstr = dkg2.process_reconstruct_commits(&rc);
+
+        assert!(reconstr.is_err());
+
+        dkg2.commitments.remove(&0);
+
+        // invalid index
+        let correct_ind = rc.index;
+        rc.index = participants_count;
+        let reconstr = dkg2.process_reconstruct_commits(&rc);
+
+        assert!(reconstr.is_err());
+
+        rc.index = correct_ind;
+
+        // invalid sig
+        let correct_sig = rc.signature;
+        rc.signature = custom_signature();
+        let reconstr = dkg2.process_reconstruct_commits(&rc);
+
+        assert!(reconstr.is_err());
+
+        rc.signature = correct_sig;
+
+        // all fine
+        let reconstr = dkg2.process_reconstruct_commits(&rc);
+
+        assert!(reconstr.is_ok());
+
+        // packet already received
+        let mut found: bool = false;
+        for p in dkg2
+            .pending_reconstruct
+            .get(&rc.dealer_index)
+            .unwrap()
+            .iter()
+        {
+            if p.index == rc.index {
+                found = true;
+                break;
+            }
+        }
+
+        assert!(found);
+        assert!(!dkg2.finished());
+
+        // generate enough secret commits to recover the secret
+        for ind in 2..dkgs.len() {
+            let dkg: &mut DistKeyGenerator = dkgs.get_mut(ind as usize).unwrap();
+            let share: vssDeal = dkg.verifiers.get_mut(&0).unwrap().get_deal().unwrap();
+            let msg = ReconstructCommits::hash(dkg.index, 0, &share.sec_share).unwrap();
+            let signature = sign::sign_msg(
+                dkg.long.get_element().to_bytes(),
+                dkg.pub_key.get_element().to_bytes(),
+                &msg,
+                &dkg.index.to_le_bytes(),
+            )
+            .unwrap();
+            let mut rc = ReconstructCommits {
+                session_id: share.session_id.clone(),
+                index: dkg.index,
+                dealer_index: 0,
+                share: share.sec_share.clone(),
+                signature,
+            };
+
+            if dkg2.reconstructed.contains(&0) {
+                break;
+            }
+
+            let correct_sid = rc.session_id;
+            rc.session_id = [0u8; 32].to_vec();
+            dkg2.process_reconstruct_commits(&rc)
+                .expect_err("Invalid session ID");
+
+            rc.session_id = correct_sid;
+
+            dkg2.process_reconstruct_commits(&rc).unwrap();
+        }
+
+        assert!(dkg2.reconstructed.contains(&0));
+
+        let com: &PubPoly = dkg2.commitments.get(&0).unwrap();
+
+        let dkg = dkgs.get_mut(0).unwrap();
+
+        assert_eq!(dkg.dealer.secret_commit().unwrap(), com.commit());
+
+        assert!(dkg2.finished());
+    }
+
+    #[test]
+    fn test_dkg_set_timeout() {
+        let participants_count: u32 = 7;
+        let init_data = setup(participants_count);
+
+        let mut dkgs: Vec<DistKeyGenerator> = init_data.dkgs;
+
+        // full secret sharing exchange
+        // 1. broadcast deals
+        let mut resps: Vec<Response> = Vec::new();
+        for dkg_ind in 0..dkgs.len() {
+            let deals = dkgs[dkg_ind].deals().unwrap();
+            for (&i, deal) in deals.iter() {
+                let resp: Response = dkgs[i as usize].process_deal(deal).unwrap();
+
+                assert!(resp.response.approved);
+
+                resps.push(resp);
+            }
+        }
+        // 2. broadcast response
+        for r in resps.iter() {
+            for dkg in dkgs.iter_mut() {
+                if !dkg.verifiers.get(&r.index).unwrap().enough_approvals()
+                    && r.response.index != dkg.index
+                {
+                    let j = dkg.process_response(r).unwrap();
+
+                    assert!(j.is_none());
+                }
+            }
+        }
+        // 3. make sure everyone has the same QUAL set
+        for dkg in dkgs.iter() {
+            for dkg2 in dkgs.iter() {
+                assert!(!dkg.is_in_qual(dkg2.index));
+            }
+        }
+
+        for dkg in dkgs.iter_mut() {
+            dkg.set_timeout();
+        }
+
+        for dkg in dkgs.iter() {
+            for dkg1 in dkgs.iter() {
+                assert!(dkg.is_in_qual(dkg1.index));
+            }
+        }
+    }
+
+    #[test]
+    fn test_dkg_dist_key_share() {
+        let participants_count: u32 = 7;
+        let init_data = setup(participants_count);
+
+        let mut dkgs: Vec<DistKeyGenerator> = init_data.dkgs;
+        full_exchange(&mut dkgs, participants_count);
+
+        let mut scs: Vec<SecretCommits> = Vec::new();
+
+        for ind in 0..participants_count as usize - 1 {
+            let sc: SecretCommits = dkgs[ind].secret_commits().unwrap();
+            #[allow(clippy::needless_range_loop)]
+            for ind2 in 0..participants_count as usize - 1 {
+                if ind == ind2 {
+                    continue;
+                }
+                let cc = dkgs[ind2].process_secret_commit(&sc).unwrap();
+
+                assert!(cc.is_none());
+            }
+            scs.push(sc);
+        }
+
+        // check that we can't get the dist key share before exchanging commitments
+        let mut last_dkg: DistKeyGenerator =
+            dkgs.get((participants_count - 1) as usize).unwrap().clone();
+        last_dkg
+            .dist_key_share()
+            .expect_err("Didn't exchange committments yet");
+
+        for sc in scs.iter() {
+            let cc = last_dkg.process_secret_commit(sc).unwrap();
+
+            assert!(cc.is_none());
+        }
+
+        let sc: SecretCommits = last_dkg.secret_commits().unwrap();
+
+        for dkg in dkgs.iter_mut().take(participants_count as usize - 1) {
+            let sc = dkg.process_secret_commit(&sc).unwrap();
+
+            assert!(sc.is_none());
+            assert_eq!(participants_count, dkg.qual().len() as u32);
+            assert_eq!(participants_count, dkg.commitments.len() as u32);
+        }
+
+        // missing one commitment
+        let last_commitment0 = last_dkg.commitments.get(&0).unwrap().clone();
+        last_dkg.commitments.remove(&0);
+        let dks = last_dkg.dist_key_share();
+
+        assert!(dks.is_err());
+
+        last_dkg.commitments.insert(0, last_commitment0);
+
+        dkgs.remove((participants_count - 1) as usize);
+        dkgs.insert((participants_count - 1) as usize, last_dkg);
+
+        // everyone should be finished
+        for dkg in dkgs.iter_mut() {
+            assert!(dkg.finished());
+        }
+        // verify integrity of shares etc
+        let mut dkss: Vec<DistKeyShare> = Vec::new();
+        for dkg in dkgs.iter_mut() {
+            let dks: DistKeyShare = dkg.dist_key_share().unwrap();
+            assert_eq!(dkg.index, dks.share.i);
+
+            dkss.push(dks);
+        }
+
+        let mut shares: Vec<PriShare<FE>> = Vec::new();
+        for dks in dkss.iter() {
+            assert!(check_dks(dks, dkss.get(0 as usize).unwrap()));
+            shares.push(dks.share.clone());
+        }
+
+        let secret = poly::recover_secret(&shares.as_slice(), participants_count / 2 + 1).unwrap();
+
+        let generator = GE::generator();
+        let commit_secret = generator.scalar_mul(&secret.get_element());
+
+        assert_eq!(
+            dkss.get(0 as usize).unwrap().get_public_key(),
+            commit_secret
+        );
+    }
+
+    fn check_dks(dks1: &DistKeyShare, dks2: &DistKeyShare) -> bool {
+        if dks1.commits.len() != dks2.commits.len() {
+            return false;
+        }
+        for (i, p) in dks1.commits.iter().enumerate() {
+            if p != dks2.commits.get(i).unwrap() {
+                return false;
+            }
+        }
+        true
+    }
+}
